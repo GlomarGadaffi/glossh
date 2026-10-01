@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define LSSH_VERSION_STR "0.1.0"
+#define LSSH_VERSION_STR "0.2.0"
 
 /* Transport-level maximum packet size we accept/emit. OpenSSH KEXINIT is
  * ~1.5 KB; 4 KB leaves headroom. Raise if you need bigger channel writes
@@ -82,6 +82,13 @@ typedef struct lssh_config {
     void (*on_pty)(void *user, lssh_session_t *s, uint16_t cols, uint16_t rows);
     /* Channel torn down (client close, EOF+close, or transport loss). */
     void (*on_close)(void *user, lssh_session_t *s);
+    /* Periodic callback while the session channel is open, for animation,
+     * live status screens and input timeouts. Runs on the server task
+     * between packets, at most every `tick_ms` (NULL or 0 disables). Safe to
+     * call lssh_write()/lssh_exit() from here. recv_timeout_ms still
+     * measures inbound silence: ticks do not keep an idle client alive. */
+    void (*on_tick)(void *user, lssh_session_t *s);
+    uint32_t tick_ms;
 
     void *user;                /* opaque pointer handed to every callback */
     volatile bool *stop;       /* optional: set *stop=true to make
@@ -113,6 +120,12 @@ const char *lssh_username(const lssh_session_t *s);
 
 /* Whether the client requested a pty. */
 bool lssh_has_pty(const lssh_session_t *s);
+
+/* TERM value from the client's pty-req ("" if none). */
+const char *lssh_term(const lssh_session_t *s);
+
+/* Client identification line, e.g. "SSH-2.0-OpenSSH_9.6". */
+const char *lssh_client_version(const lssh_session_t *s);
 
 /* --- host key helpers --- */
 /* Generate a fresh P-256 host key scalar (store it: NVS on ESP-IDF). */
