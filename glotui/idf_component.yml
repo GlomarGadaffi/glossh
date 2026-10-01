@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "16-color ANSI-art terminal UI (CP437 cell buffer, diff renderer, key decoder) over any byte stream"
+license: "Apache-2.0"
+dependencies:
+  idf: ">=5.0"
