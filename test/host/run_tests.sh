@@ -2,7 +2,8 @@
 # littlessh integration tests against a real OpenSSH client
 cd "$(dirname "$0")"
 PORT=${1:-2222}
-OPTS="-p $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
+BASE="-p $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5"
+OPTS="$BASE -o LogLevel=ERROR"
 PASS=0; FAIL=0
 ok(){ echo "PASS: $1"; PASS=$((PASS+1)); }
 bad(){ echo "FAIL: $1"; FAIL=$((FAIL+1)); }
@@ -18,8 +19,10 @@ rc=$?
 [ "$out" = "exec:status please" ] && [ $rc -eq 0 ] && ok "exec+password (rc=$rc out='$out')" \
   || bad "exec+password (rc=$rc out='$out')"
 
-# 2. exit status propagation (harness exits 0; check a clean rc again w/ banner visible)
-grep -q "authorized use only" c1.log && ok "userauth banner delivered" || bad "banner missing"
+# 2. userauth banner (OpenSSH only prints banners at LogLevel INFO or above;
+#    ssh keeps the first value per option, so this can't reuse $OPTS)
+timeout 10 sshpass -p hunter2 ssh $BASE -o LogLevel=INFO admin@127.0.0.1 true 2>c2.log
+grep -q "authorized use only" c2.log && ok "userauth banner delivered" || bad "banner missing"
 
 # 3. wrong password rejected
 timeout 10 sshpass -p wrong ssh $OPTS -o NumberOfPasswordPrompts=1 admin@127.0.0.1 true 2>/dev/null

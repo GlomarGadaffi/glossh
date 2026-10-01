@@ -16,6 +16,9 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -115,6 +118,7 @@ struct lssh_session {
     bool ch_sent_close, ch_rcvd_close, ch_sent_eof;
     bool notified_close;
     bool has_pty;
+    char term[32];
     uint32_t ch_remote_id;
     uint32_t win_out;               /* remote-granted window (we may send) */
     uint32_t max_out;               /* remote max packet size */
@@ -835,6 +839,7 @@ static int handle_channel_open(lssh_session_t *s, const uint8_t *pl, size_t pn){
     s->ch_sent_close = s->ch_rcvd_close = s->ch_sent_eof = false;
     s->notified_close = false;
     s->has_pty = false;
+    s->term[0] = 0;
     s->ch_remote_id = sender;
     s->win_out = win;
     s->max_out = maxpkt;
@@ -870,6 +875,7 @@ static int handle_channel_request(lssh_session_t *s, const uint8_t *pl, size_t p
             rd_u32(&r,&px) && rd_u32(&r,&py) &&
             rd_string(&r,&modes,&modes_len)){
             s->has_pty = true;
+            memcpy(s->term, term, strlen(term) + 1);
             if (s->cfg->on_pty)
                 s->cfg->on_pty(s->cfg->user, s, (uint16_t)cols, (uint16_t)rows);
             return want_reply ? ch_reply(s, true) : 0;
@@ -1028,6 +1034,8 @@ static int process_packet(lssh_session_t *s){
 
 const char *lssh_username(const lssh_session_t *s){ return s->username; }
 bool lssh_has_pty(const lssh_session_t *s){ return s->has_pty; }
+const char *lssh_term(const lssh_session_t *s){ return s->term; }
+const char *lssh_client_version(const lssh_session_t *s){ return s->v_c; }
 
 ssize_t lssh_write(lssh_session_t *s, const void *data, size_t len){
     if (!s->ch_open || s->ch_sent_close || s->ch_sent_eof || s->dead) return -1;
@@ -1184,11 +1192,53 @@ static int version_exchange(lssh_session_t *s){
     return -1;
 }
 
+static uint64_t mono_ms(void){
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* 1 readable, 0 timeout, -1 error */
+static int wait_readable(int fd, uint32_t ms){
+    fd_set rf; FD_ZERO(&rf); FD_SET(fd, &rf);
+    struct timeval tv = { (time_t)(ms / 1000), (suseconds_t)((ms % 1000) * 1000) };
+    int r = select(fd + 1, &rf, NULL, NULL, &tv);
+    if (r < 0) return errno == EINTR ? 0 : -1;
+    return r > 0;
+}
+
+static bool ticking(const lssh_session_t *s){
+    return s->cfg->on_tick && s->cfg->tick_ms &&
+           s->ch_open && !s->ch_sent_close && !s->dead;
+}
+
 static void serve_connection(lssh_session_t *s){
     if (version_exchange(s)) return;
     if (do_kex(s, NULL, 0)) return;
+    const lssh_config_t *c = s->cfg;
+    uint64_t last_rx = mono_ms(), next_tick = 0;
     while (!s->dead){
+        /* With ticks on, wait for the next packet in select() so on_tick can
+         * run in between; SO_RCVTIMEO never fires there, so enforce the idle
+         * timeout here. A packet that has started arriving is still read
+         * whole by the blocking path below. */
+        if (ticking(s)){
+            uint64_t now = mono_ms();
+            if (c->recv_timeout_ms && now - last_rx >= c->recv_timeout_ms) break;
+            if (now >= next_tick){
+                next_tick = now + c->tick_ms;
+                c->on_tick(c->user, s);
+                continue;
+            }
+            uint64_t wait = next_tick - now;
+            if (c->recv_timeout_ms && last_rx + c->recv_timeout_ms - now < wait)
+                wait = last_rx + c->recv_timeout_ms - now;
+            int r = wait_readable(s->fd, (uint32_t)wait);
+            if (r < 0) break;
+            if (r == 0) continue;
+        }
         if (process_packet(s)) break;
+        last_rx = mono_ms();
     }
     ch_teardown(s);
 }
