@@ -18,6 +18,12 @@ Thumbs.db
 docs/
 notes/
 *.txt
+!CMakeLists.txt
 LINEAGE.md
 *.old
 *.bak
+# host test binaries and keys
+test/host/harness
+test/host/glotui_test
+test/host/bbs_host
+test/host/id_ecdsa*
