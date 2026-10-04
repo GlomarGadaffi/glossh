@@ -61,6 +61,8 @@ dots=$(printf '%s' "$out" | tr -cd . | wc -c)
   || bad "on_data input intact across window pump (dots=$dots)"
 
 # 9. client-initiated rekey mid-stream (RekeyLimit 16K vs 3 MiB of output)
+#    (ssh -E appends, so a stale log would satisfy the count on a rerun)
+rm -f c9.log
 out=$(printf '\002hello\rexit\r' | timeout 30 sshpass -p hunter2 ssh -tt $BASE -o LogLevel=DEBUG1 \
       -o RekeyLimit=16K -E c9.log admin@127.0.0.1)
 dots=$(printf '%s' "$out" | tr -cd . | wc -c)
