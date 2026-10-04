@@ -3,7 +3,8 @@
  * Board: LilyGO T-ETH-ELITE S3 (ESP32-S3 + W5500). W5500 pin map and init are
  * lifted from the drawbridge project (the device this targets).
  *
- * Connect:  ssh -o StrictHostKeyChecking=no admin@<board-ip>   (password: changeme)
+ * Connect:  ssh admin@<board-ip>   (password: changeme; check the host key
+ *           fingerprint against the boot log on first connect)
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -178,7 +179,7 @@ static void ssh_task(void *arg)
     if (lssh_hostkey_fingerprint(hostkey, fp, sizeof(fp)) == 0)
         ESP_LOGI(TAG, "host key fingerprint: %s", fp);
 
-    ESP_LOGI(TAG, "SSH ready: ssh -o StrictHostKeyChecking=no admin@" IPSTR
+    ESP_LOGI(TAG, "SSH ready: ssh admin@" IPSTR
              "  (password: changeme)", IP2STR(&s_ip));
 
     lssh_config_t cfg = {

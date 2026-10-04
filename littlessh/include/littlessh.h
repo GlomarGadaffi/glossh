@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define LSSH_VERSION_STR "0.2.0"
+#define LSSH_VERSION_STR "0.3.0"
 
 /* Transport-level maximum packet size we accept/emit. OpenSSH KEXINIT is
  * ~1.5 KB; 4 KB leaves headroom. Raise if you need bigger channel writes
@@ -41,6 +41,12 @@ extern "C" {
 #define LSSH_WINDOW 65536
 #endif
 
+/* Wall-clock budget from accept() to successful auth when
+ * lssh_config_t.auth_timeout_ms is 0 (cf. OpenSSH LoginGraceTime). */
+#ifndef LSSH_AUTH_TIMEOUT_DEFAULT_MS
+#define LSSH_AUTH_TIMEOUT_DEFAULT_MS 60000
+#endif
+
 typedef struct lssh_session lssh_session_t;
 
 typedef struct lssh_config {
@@ -52,13 +58,19 @@ typedef struct lssh_config {
 
     /* --- identity --- */
     const uint8_t *host_key;  /* 32-byte P-256 private scalar (big-endian).
-                               * NULL => ephemeral key per boot (clients will
-                               * see the host key change; fine for bring-up,
-                               * wrong for production). */
+                               * NULL => ephemeral key, generated once per
+                               * lssh_server_run() (clients see it change
+                               * every boot; fine for bring-up, wrong for
+                               * production). */
 
     /* --- policy --- */
     uint32_t auth_max_tries;   /* 0 => 5 */
     uint32_t recv_timeout_ms;  /* 0 => no socket receive timeout */
+    uint32_t auth_timeout_ms;  /* whole login (connect to auth success) must
+                                * finish within this; 0 => 60 s
+                                * (LSSH_AUTH_TIMEOUT_DEFAULT_MS). One client
+                                * at a time, so this is what stops an
+                                * unauthenticated peer holding the console. */
     const char *banner;        /* optional pre-auth banner text (may be NULL) */
 
     /* --- authentication callbacks (at least one must be non-NULL) --- */
@@ -71,12 +83,16 @@ typedef struct lssh_config {
     bool (*pubkey_auth)(void *user, const char *username,
                         const uint8_t *blob, size_t blob_len);
 
-    /* --- session callbacks --- */
+    /* --- session callbacks ---
+     * All run on the server task, from the connection loop, one at a time:
+     * never nested inside another callback, even when an lssh_write() made
+     * from a callback has to read packets while waiting for window. */
     /* Channel is up and the client requested a shell (exec_cmd == NULL) or
      * command execution (exec_cmd != NULL, NUL-terminated). Safe to call
      * lssh_write()/lssh_exit() from here. */
     void (*on_open)(void *user, lssh_session_t *s, const char *exec_cmd);
-    /* Keystrokes / stdin from the client. */
+    /* Keystrokes / stdin from the client. `data` stays valid and unchanged
+     * for the whole call, including across lssh_write(). */
     void (*on_data)(void *user, lssh_session_t *s, const uint8_t *data, size_t len);
     /* pty-req and window-change. May be NULL. */
     void (*on_pty)(void *user, lssh_session_t *s, uint16_t cols, uint16_t rows);
@@ -97,13 +113,18 @@ typedef struct lssh_config {
 } lssh_config_t;
 
 /* Blocking accept loop. Serves one client at a time. Returns 0 on a clean
- * stop (via cfg->stop), negative on unrecoverable setup error. Run it in a
- * dedicated FreeRTOS task on ESP-IDF (>= 8 KB stack recommended). */
+ * stop (via cfg->stop), negative on error: -1 bad config, -2 crypto init,
+ * -3 socket/bind/listen, -4 out of memory, -5 host key, -6 accept() failed.
+ * Run it in a dedicated FreeRTOS task on ESP-IDF (>= 8 KB stack
+ * recommended). All memory is allocated here, before the first accept(). */
 int lssh_server_run(const lssh_config_t *cfg);
 
 /* Write to the client's terminal (channel stdout). Fragments to the peer's
  * window/packet limits; may internally pump the connection while waiting
- * for window space. Returns bytes written or -1 if the channel is gone. */
+ * for window space (inbound events are queued, not delivered, meanwhile).
+ * Returns bytes written, which is short only if the client keeps sending
+ * input while granting no window; -1 if the channel is gone. Server task
+ * only (i.e. from the callbacks above). */
 ssize_t lssh_write(lssh_session_t *s, const void *data, size_t len);
 
 /* printf convenience over lssh_write (LF is not translated; send \r\n

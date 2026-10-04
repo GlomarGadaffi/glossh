@@ -29,21 +29,34 @@ static void on_open(void *u, lssh_session_t *s, const char *exec_cmd){
                 lssh_username(s), lssh_has_pty(s) ? 1 : 0);
 }
 
-static char line[256];
+static char line[8192];
 static size_t line_len;
+
+/* ^B: write BIG_LEN dots in one call. That outruns the client's channel
+ * window, so lssh_write() has to pump inbound packets mid-callback. */
+#define BIG_LEN (3u << 20)
 
 static void on_data(void *u, lssh_session_t *s, const uint8_t *d, size_t n){
     (void)u;
     for (size_t i = 0; i < n; i++){
         char c = (char)d[i];
-        if (c == '\r' || c == '\n'){
+        if (c == 0x02){
+            char *big = malloc(BIG_LEN);
+            if (big){
+                memset(big, '.', BIG_LEN);
+                lssh_write(s, big, BIG_LEN);
+                free(big);
+            }
+        } else if (c == '\r' || c == '\n'){
             lssh_write(s, "\r\n", 2);
             line[line_len] = 0;
             if (strcmp(line, "exit") == 0){
                 lssh_printf(s, "bye\r\n");
                 lssh_exit(s, 0);
             } else if (line_len){
-                lssh_printf(s, "echo:%s\r\n> ", line);
+                lssh_write(s, "echo:", 5);
+                lssh_write(s, line, line_len);   /* > 1 packet for long lines */
+                lssh_write(s, "\r\n> ", 4);
             } else {
                 lssh_write(s, "> ", 2);
             }
@@ -81,7 +94,9 @@ int main(int argc, char **argv){
     lssh_config_t cfg = {
         .port = port,
         .listen_fd = -1,
-        .host_key = hostkey,
+        .host_key = getenv("LSSH_EPHEMERAL") ? NULL : hostkey,
+        .auth_timeout_ms = getenv("LSSH_AUTH_TIMEOUT_MS")
+                           ? (uint32_t)atoi(getenv("LSSH_AUTH_TIMEOUT_MS")) : 0,
         .banner = "littlessh harness — authorized use only\n",
         .password_auth = pw_auth,
         .pubkey_auth = pk_auth,
