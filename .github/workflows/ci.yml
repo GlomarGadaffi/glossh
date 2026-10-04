@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: install tools
+        run: |
+          apt-get update
+          apt-get install -y build-essential libmbedtls-dev openssh-client sshpass \
+            python3 procps util-linux cppcheck clang-tidy git
+      - uses: actions/checkout@v4
+      - name: host tests
+        run: |
+          cd test/host
+          make
+          bash run_tests.sh
+          ./glotui_test
+          bash bbs_smoke.sh
+      - name: lint selftest
+        run: bash tools/lint.sh --selftest
+      - name: lint
+        run: bash tools/lint.sh

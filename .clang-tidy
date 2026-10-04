@@ -1,0 +1,34 @@
+# Power-of-10 gate for littlessh (run via tools/lint.sh; checked with clang-tidy 19).
+#
+# Rule map:
+#   1  no goto        cppcoreguidelines-avoid-goto is enabled, but clang-tidy 19
+#                     does not report C gotos (verified empirically), so the
+#                     real gate is the grep in tools/lint.sh.
+#   4  <= 60 lines    readability-function-size, LineThreshold 60.
+#   5  asserts        tools/assert_density.py (not clang-tidy).
+#   7  check returns  bugprone-unused-return-value for every psa_* call and
+#                     every rd_* reader; an explicit (void) cast is the only
+#                     accepted way to drop one. cert-err33-c covers libc.
+#   -  switch default bugprone-switch-missing-default-case (part of bugprone-*).
+#                     It fires only on non-enum selectors; enum switches are
+#                     covered by the compiler's -Wswitch.
+#
+# Exclusions:
+#   bugprone-easily-swappable-parameters: flags nearly every (ptr, len) pair
+#   in a wire-format codec; it is advice about API shape, not a defect.
+Checks: >-
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  cert-err33-c,
+  cppcoreguidelines-avoid-goto,
+  readability-function-size
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'littlessh/include/'
+CheckOptions:
+  readability-function-size.LineThreshold: 60
+  # Regexes against the qualified name: clang-tidy 19 accepts them here
+  # (proved by tools/lint.sh --selftest). Setting this replaces the default
+  # libc list, which cert-err33-c covers instead.
+  bugprone-unused-return-value.CheckedFunctions: '^::psa_.*;^::rd_.*'
+  bugprone-unused-return-value.AllowCastToVoid: true

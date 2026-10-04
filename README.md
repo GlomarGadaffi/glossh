@@ -59,6 +59,8 @@ cd test/host && make
 
 `test/host`: `bash run_tests.sh` (littlessh vs OpenSSH: auth, pty, >4 KB lines, writes that outrun the window, client rekey, pre-auth deadline, ephemeral key stability), `./glotui_test` (renderer, CP437, keys), `./wire32_test` (wire bounds with peer-sized lengths; also `make wire32_test_m32` for a 32-bit `size_t`, where `off + n` can wrap), `bash bbs_smoke.sh` (BBS end to end vs OpenSSH, incl. idle timeout under ticks). needs libmbedtls-dev, openssh-client, sshpass.
 
+`bash tools/lint.sh` is the Power-of-10 gate for littlessh: cppcheck, clang-tidy (`.clang-tidy`: functions <= 60 lines, every `psa_*`/`rd_*` result used or cast to `(void)`, switch default), a no-`goto` grep and `LSSH_ASSERT` density >= 2 per function (`tools/assert_density.py`). `bash tools/lint.sh --selftest` injects one violation per rule into a copy of littlessh.c and fails unless each check reports it at the injected spot.
+
 ## why
 
 bring remote console to microcontrollers without the overhead of OpenSSH or dropbear. justifiable in homelabs, field setups, and scenarios where the alternate (serial console over RF) requires human intervention. based on PSA Crypto for compatibility across ESP-IDF versions (mbedTLS 2.28/3.x/4.x).
