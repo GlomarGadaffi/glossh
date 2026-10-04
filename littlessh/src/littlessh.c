@@ -453,9 +453,10 @@ static void hash_string(psa_hash_operation_t *op, const uint8_t *d, size_t n){
 static int kdf(const uint8_t *kmp, size_t kmplen, const uint8_t H[32],
                const uint8_t sid[32], char letter, uint8_t *out, size_t need){
     uint8_t acc[64]; size_t have = 0;
+    int rc = -1;
     while (have < need){
         psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
-        if (psa_hash_setup(&op, PSA_ALG_SHA_256) != PSA_SUCCESS) return -1;
+        if (psa_hash_setup(&op, PSA_ALG_SHA_256) != PSA_SUCCESS) goto out;
         psa_hash_update(&op, kmp, kmplen);
         psa_hash_update(&op, H, 32);
         if (have == 0){
@@ -466,13 +467,16 @@ static int kdf(const uint8_t *kmp, size_t kmplen, const uint8_t H[32],
             psa_hash_update(&op, acc, have);
         }
         size_t olen = 0;
-        if (have + 32 > sizeof acc) { psa_hash_abort(&op); return -1; }
+        if (have + 32 > sizeof acc) { psa_hash_abort(&op); goto out; }
         if (psa_hash_finish(&op, acc + have, 32, &olen) != PSA_SUCCESS || olen != 32)
-            return -1;
+            goto out;
         have += 32;
     }
     memcpy(out, acc, need);
-    return 0;
+    rc = 0;
+out:
+    wipe(acc, sizeof acc);
+    return rc;
 }
 
 /* Run a key exchange. If client_kexinit != NULL the client's KEXINIT was
@@ -767,12 +771,12 @@ static int handle_userauth(lssh_session_t *s, const uint8_t *pl, size_t pn){
         bool change; char pass[128];
         if (!rd_bool(&r,&change) || change ||
             !rd_cstring(&r, pass, sizeof pass)){
-            memset(pass, 0, sizeof pass);
+            wipe(pass, sizeof pass);
             send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "bad password msg");
             return -1;
         }
         ok = s->cfg->password_auth(s->cfg->user, user, pass);
-        memset(pass, 0, sizeof pass);
+        wipe(pass, sizeof pass);
     } else if (strcmp(method, "publickey") == 0 && s->cfg->pubkey_auth){
         bool has_sig; char alg[40];
         const uint8_t *blob; uint32_t blob_len;
