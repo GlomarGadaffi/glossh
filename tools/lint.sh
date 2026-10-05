@@ -205,6 +205,32 @@
 #     esp checks become TOOL-ERRORs (fail closed).
 #   - cppcheck sees a header only through a .c file that includes it
 #     (clang-tidy and the p10 rules read every header).
+#   Found by review round 2, left open (each needs a deliberately adversarial
+#   author; each passed with exit 0):
+#   - Rule 7: a drop inside a function-like macro body, `#define M(c) ((c) &&
+#     psa_crypto_init())` (also ||, !, ==, + 0): clang turns -Wunused-value
+#     and -Wunused-comparison off in macro expansions, as it does -Wcomma.
+#   - Rule 7: a libc builtin spelled directly, `__builtin_snprintf(...);`: the
+#     shim redeclares only header-declared names; bugprone/cert match by name.
+#   - Rule 7: a system header included with quotes, `#include "unistd.h"`:
+#     the shim collects headers by `#include <...>` spelling only, so their
+#     functions get no warn_unused_result (and && / || drops pass).
+#   - Rule 7: a non-void function prototyped in littlessh/ but not defined
+#     there (a hand-written libc prototype `int fchmod(int, mode_t);`, or an
+#     app/platform hook): neither the shim nor p10-must-check covers it.
+#   - Rule 7: a callee cast to its own pointer type, `((int (*)(int))close)
+#     (fd);`: clang's callee lookup does not see through the cast.
+#   - Rule 7: a ?: that picks the callee, `(c ? close : fsync)(fd);`: no
+#     name( in either arm for p10-ternary-call, and no callee decl for clang.
+#   - Rule 5: a littlessh/include/assert.h that shadows <assert.h> (assert as a
+#     function pointer): pp's assert-mark stub include_next's past it and
+#     still counts, while tidy, cppcheck and the real build use it.
+#   - Rule 5 / coverage: littlessh/CMakeLists.txt adding NDEBUG or `-include
+#     src/extra.inc`: only the suppression scan reads it, and non-.c/.h files
+#     under littlessh/ are not linted.
+#   - Rule 5: the assert marker forged by ## pasting, LSSH_CAT(lssh_lint_
+#     assert_, mark_)(x): p10-assert-def scans source text for the reserved
+#     name, but the pp counter counts the pasted token as an assert.
 #   - Loop bounds (rule 2), heap use after init (rule 3), data scope (rule 6),
 #     pointer use (rule 9) and warnings-clean compilation (rule 10) are not
 #     mechanically checked here.
