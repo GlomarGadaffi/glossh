@@ -140,9 +140,25 @@ static void test_keys(void){
     CHECK(nkeys == 1 && keys[0] == 0x82);
 }
 
+/* gt_end parks the cursor on the last row before leaving the alternate
+ * screen, so text printed after it lands at the bottom even on terminals
+ * that ignore 1049l (SyncTERM, the Linux console) */
+static void test_end(void){
+    gt_t *t = gt_new(wr, NULL, 80, 24);
+    CHECK(t);
+    gt_begin(t);
+    gt_flush(t);
+    reset();
+    gt_end(t);
+    const char *park = strstr(out, "\x1b[24;1H"), *leave = strstr(out, "\x1b[?1049l");
+    CHECK(park != NULL && leave != NULL && park < leave);
+    gt_free(t);
+}
+
 int main(void){
     test_cp437();
     test_render();
+    test_end();
     test_keys();
     printf(fails ? "glotui: %d FAILED\n" : "glotui: all tests passed\n", fails);
     return fails != 0;
