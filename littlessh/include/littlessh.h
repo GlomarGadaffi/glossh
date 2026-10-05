@@ -133,7 +133,9 @@ LSSH_MUST_CHECK int lssh_server_run(const lssh_config_t *cfg);
  * window/packet limits; may internally pump the connection while waiting
  * for window space (inbound events are queued, not delivered, meanwhile).
  * Returns bytes written, which is short only if the client keeps sending
- * input while granting no window; -1 if the channel is gone. Server task
+ * input while granting no window, or after LSSH_WRITE_MAX_PUMPS (256)
+ * packets pumped in a row without the window growing; -1 if the channel is
+ * gone. Server task
  * only (i.e. from the callbacks above). */
 LSSH_MUST_CHECK ssize_t lssh_write(lssh_session_t *s, const void *data, size_t len);
 
@@ -162,7 +164,9 @@ const char *lssh_client_version(const lssh_session_t *s);
 /* Generate a fresh P-256 host key scalar (store it: NVS on ESP-IDF). */
 LSSH_MUST_CHECK int lssh_hostkey_generate(uint8_t out[32]);
 /* OpenSSH-style fingerprint "SHA256:<base64>" of the corresponding public
- * key, for display/TOFU. Returns 0 on success. */
+ * key, for display/TOFU. Returns 0 on success; -1 on failure, including
+ * key == NULL (the ephemeral key a NULL host_key gets is made inside
+ * lssh_server_run() and has no fingerprint here). */
 LSSH_MUST_CHECK int lssh_hostkey_fingerprint(const uint8_t key[32], char *out, size_t outlen);
 
 #ifdef __cplusplus

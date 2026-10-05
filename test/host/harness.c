@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <signal.h>
+#include <sys/time.h>
 
 static uint8_t hostkey[32];
 
@@ -81,6 +83,18 @@ static void on_close(void *u, lssh_session_t *s){
     line_len = 0;
 }
 
+static void on_alarm(int sig){ (void)sig; }
+
+/* LSSH_SIGSTORM: SIGALRM every 2 ms without SA_RESTART, so every blocking
+ * recv()/select() on the server returns EINTR over and over */
+static void sigstorm(void){
+    struct sigaction sa = { .sa_handler = on_alarm };   /* no SA_RESTART */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it = { { 0, 2000 }, { 0, 2000 } };
+    setitimer(ITIMER_REAL, &it, NULL);
+}
+
 int main(int argc, char **argv){
     uint16_t port = argc > 1 ? (uint16_t)atoi(argv[1]) : 2222;
 
@@ -90,6 +104,9 @@ int main(int argc, char **argv){
     char fp[64];
     if (lssh_hostkey_fingerprint(hostkey, fp, sizeof fp) == 0)
         fprintf(stderr, "harness: host key %s\n", fp);
+    fprintf(stderr, "harness: fingerprint(NULL) rc=%d\n",
+            lssh_hostkey_fingerprint(NULL, fp, sizeof fp));
+    if (getenv("LSSH_SIGSTORM")) sigstorm();
 
     lssh_config_t cfg = {
         .port = port,

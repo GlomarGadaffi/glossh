@@ -192,7 +192,13 @@ struct lssh_session {
 #define LSSH_KEX_MAX_SKIP    32   /* IGNORE/DEBUG skipped per KEX wait */
 #endif
 #ifndef LSSH_IO_MAX_RETRY
-#define LSSH_IO_MAX_RETRY    64   /* socket waits in a row that move no bytes */
+#define LSSH_IO_MAX_RETRY    64   /* send() calls in a row that move no bytes */
+#endif
+/* EINTRs (and deadline wake-ups) per socket call. A proof bound, not a
+ * policy: signals say nothing about the peer, so this is set far above any
+ * real signal rate (a 1 kHz timer takes ~11 days to reach it). */
+#ifndef LSSH_IO_MAX_EINTR
+#define LSSH_IO_MAX_EINTR    1000000000u
 #endif
 #ifndef LSSH_WRITE_MAX_PUMPS
 #define LSSH_WRITE_MAX_PUMPS 256  /* packets pumped in a row without window */
@@ -330,9 +336,10 @@ static LSSH_MUST_CHECK int io_recv_exact(lssh_session_t *s, uint8_t *buf, size_t
     /* lengths from the wire are range-checked before they get here */
     LSSH_ASSERT(n > 0 && n <= sizeof s->inbuf);
     size_t got = 0;
-    unsigned stall = 0;   /* passes in a row that read nothing */
+    unsigned intr = 0;   /* passes cut short by EINTR or the deadline */
+    /* every pass returns, reads >= 1 byte, or counts one in intr */
     while (got < n){
-        if (stall++ >= LSSH_IO_MAX_RETRY) return -1;
+        if (intr >= LSSH_IO_MAX_EINTR) return -1;
         /* until auth succeeds the whole login shares one wall-clock budget,
          * so a silent or trickling client cannot hold the only slot */
         if (!s->authed && s->auth_deadline){
@@ -340,16 +347,15 @@ static LSSH_MUST_CHECK int io_recv_exact(lssh_session_t *s, uint8_t *buf, size_t
             if (now >= s->auth_deadline) return -1;
             int w = wait_readable(s->fd, (uint32_t)(s->auth_deadline - now));
             if (w < 0) return -1;
-            if (w == 0) continue;   /* timeout or EINTR: re-check the deadline */
+            if (w == 0){ intr++; continue; }   /* timeout or EINTR: re-check the deadline */
         }
         ssize_t r = recv(s->fd, buf+got, n-got, 0);
         if (r == 0) return -1;
         if (r < 0){
-            if (errno == EINTR) continue;
+            if (errno == EINTR){ intr++; continue; }
             return -1;
         }
         got += (size_t)r;
-        stall = 0;
     }
     LSSH_ASSERT(got == n);
     return 0;
@@ -359,16 +365,17 @@ static LSSH_MUST_CHECK int io_send_all(lssh_session_t *s, const uint8_t *buf, si
     LSSH_ASSERT(s != NULL && buf != NULL);
     LSSH_ASSERT(n > 0 && n <= sizeof s->outbuf);
     size_t sent = 0;
-    unsigned stall = 0;   /* passes in a row that sent nothing */
+    unsigned stall = 0;   /* send() calls in a row that sent nothing */
+    unsigned intr = 0;    /* EINTRs: not stalls (see LSSH_IO_MAX_EINTR) */
     while (sent < n){
-        if (stall++ >= LSSH_IO_MAX_RETRY) return -1;
+        if (stall >= LSSH_IO_MAX_RETRY || intr >= LSSH_IO_MAX_EINTR) return -1;
         /* a peer that already hung up must not SIGPIPE the whole server */
         ssize_t r = send(s->fd, buf+sent, n-sent, MSG_NOSIGNAL);
         if (r < 0){
-            if (errno == EINTR) continue;
+            if (errno == EINTR){ intr++; continue; }
             return -1;
         }
-        if (r > 0) stall = 0;
+        stall = r > 0 ? 0 : stall + 1;
         sent += (size_t)r;
     }
     return 0;
@@ -459,8 +466,9 @@ static LSSH_MUST_CHECK int send_packet(lssh_session_t *s, const uint8_t *payload
 
 /* Receive one packet; payload/plen point into s->payload or s->inbuf. */
 static LSSH_MUST_CHECK int recv_packet(lssh_session_t *s, const uint8_t **payload, size_t *plen){
+    /* keep this before the assert: a failed rekey can leave enc set with
+     * k_in == 0, but always leaves the session dead */
     if (s->dead) return -1;
-    /* enc implies keys installed (a failed rekey leaves the session dead) */
     LSSH_ASSERT(!s->enc || s->k_in != 0);
     uint8_t lenb[4];
     if (io_recv_exact(s, lenb, 4)){ s->dead = true; return -1; }
@@ -1675,7 +1683,8 @@ static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 
 int lssh_hostkey_fingerprint(const uint8_t key[32], char *out, size_t outlen){
     LSSH_ASSERT(out != NULL);
-    if (psa_crypto_init() != PSA_SUCCESS) return -1;
+    /* hostkey_import would generate a key: a fingerprint of nothing in use */
+    if (key == NULL || psa_crypto_init() != PSA_SUCCESS) return -1;
     psa_key_id_t k = 0; uint8_t pub[65];
     int rc = -1;
     if (hostkey_import(key, &k, pub) == 0){
