@@ -18,6 +18,7 @@
 #ifndef LITTLESSH_H
 #define LITTLESSH_H
 
+#include <assert.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -28,6 +29,13 @@ extern "C" {
 #endif
 
 #define LSSH_VERSION_STR "0.3.0"
+
+/* Results that must not be dropped (Power of 10 rule 7). */
+#define LSSH_MUST_CHECK __attribute__((warn_unused_result))
+
+/* Internal invariants only, never peer input: on ESP-IDF a failed assert
+ * reboots the device. */
+#define LSSH_ASSERT(c) assert(c)
 
 /* Transport-level maximum packet size we accept/emit. OpenSSH KEXINIT is
  * ~1.5 KB; 4 KB leaves headroom. Raise if you need bigger channel writes

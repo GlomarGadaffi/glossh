@@ -93,6 +93,28 @@ static const char ALG_COMP[]    = "none";
 
 /* ------------------------------------------------------------- session  */
 
+/* Everything one key exchange holds: its secrets, the running hash of H and
+ * the bigger scratch buffers, kept off the stack (a rekey can run inside an
+ * app callback). One instance in the session; kex_ctx_wipe() clears it
+ * whenever do_kex returns. */
+typedef struct {
+    psa_hash_operation_t hop;       /* exchange hash H, fed as the exchange goes */
+    bool hop_live;
+    psa_key_id_t eph;               /* ephemeral X25519 key */
+    bool initial, skipped;
+    bool guess_follows, client_strict, guess_ok;
+    const uint8_t *ck; size_t ckn;  /* client KEXINIT (I_C), in the packet buffer */
+    uint8_t kexinit[512]; size_t klen;      /* our KEXINIT (I_S) */
+    uint8_t q_s[32], q_c[32];
+    uint8_t secret[32];
+    uint8_t kmp[40]; size_t kmp_len;        /* K as mpint, length-prefixed */
+    uint8_t ksblob[128]; size_t ks_len;     /* K_S: our host key blob */
+    uint8_t H[32];
+    uint8_t h2[32], rs[64];                 /* SHA-256(H) and its signature */
+    uint8_t rsmp[80], sigblob[160], reply[384];
+    uint8_t iv_c2s[12], iv_s2c[12], key_c2s[32], key_s2c[32];
+} kex_ctx_t;
+
 struct lssh_session {
     const lssh_config_t *cfg;
     int fd;
@@ -105,6 +127,7 @@ struct lssh_session {
     uint8_t iv_in[12], iv_out[12];
     uint8_t session_id[32];
     bool have_sid;
+    kex_ctx_t kex;                  /* live only inside do_kex */
 
     char v_c[256];                  /* client ident line, no CRLF */
 
@@ -449,14 +472,18 @@ static void hash_string(psa_hash_operation_t *op, const uint8_t *d, size_t n){
     if (n) psa_hash_update(op, d, n);
 }
 
-/* KDF from RFC 4253 §7.2: K1 = H(K||H||X||sid), Kn = H(K||H||K1..Kn-1) */
-static int kdf(const uint8_t *kmp, size_t kmplen, const uint8_t H[32],
-               const uint8_t sid[32], char letter, uint8_t *out, size_t need){
-    uint8_t acc[64]; size_t have = 0;
-    int rc = -1;
+#define KDF_ACC 64   /* two SHA-256 blocks: enough for a 32-byte key */
+
+/* KDF from RFC 4253 §7.2: K1 = H(K||H||X||sid), Kn = H(K||H||K1..Kn-1).
+ * Fills acc with whole blocks; kdf() owns acc and wipes it. */
+static LSSH_MUST_CHECK int kdf_blocks(const uint8_t *kmp, size_t kmplen, const uint8_t H[32],
+                                      const uint8_t sid[32], char letter,
+                                      uint8_t *acc, size_t need){
+    LSSH_ASSERT(kmp != NULL && acc != NULL);
+    size_t have = 0;
     while (have < need){
         psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
-        if (psa_hash_setup(&op, PSA_ALG_SHA_256) != PSA_SUCCESS) goto out;
+        if (psa_hash_setup(&op, PSA_ALG_SHA_256) != PSA_SUCCESS) return -1;
         psa_hash_update(&op, kmp, kmplen);
         psa_hash_update(&op, H, 32);
         if (have == 0){
@@ -467,218 +494,262 @@ static int kdf(const uint8_t *kmp, size_t kmplen, const uint8_t H[32],
             psa_hash_update(&op, acc, have);
         }
         size_t olen = 0;
-        if (have + 32 > sizeof acc) { psa_hash_abort(&op); goto out; }
+        if (have + 32 > KDF_ACC) { psa_hash_abort(&op); return -1; }
         if (psa_hash_finish(&op, acc + have, 32, &olen) != PSA_SUCCESS || olen != 32)
-            goto out;
+            return -1;
         have += 32;
     }
-    memcpy(out, acc, need);
-    rc = 0;
-out:
+    return 0;
+}
+
+static LSSH_MUST_CHECK int kdf(const uint8_t *kmp, size_t kmplen, const uint8_t H[32],
+                               const uint8_t sid[32], char letter, uint8_t *out, size_t need){
+    LSSH_ASSERT(out != NULL && need <= KDF_ACC);
+    uint8_t acc[KDF_ACC];
+    int rc = kdf_blocks(kmp, kmplen, H, sid, letter, acc, need);
+    if (rc == 0) memcpy(out, acc, need);
     wipe(acc, sizeof acc);
     return rc;
 }
 
-/* Run a key exchange. If client_kexinit != NULL the client's KEXINIT was
- * already consumed by the caller (rekey path). */
-static int do_kex(lssh_session_t *s, const uint8_t *client_kexinit, size_t ck_len){
-    int rc = -1;
-    bool initial = !s->have_sid;
-    psa_key_id_t eph = 0;
-    /* H is hashed as the exchange goes (V_C, V_S, I_C, I_S, ...), so neither
-     * KEXINIT payload has to outlive the packet buffer it arrived in */
-    psa_hash_operation_t hop = PSA_HASH_OPERATION_INIT;
-    bool hop_live = false;
-    uint8_t kexinit_buf[512];
-    const uint8_t *ck = client_kexinit; size_t ckn = ck_len;
-    bool skipped = false;
-    uint8_t secret[32], kmp[40], H[32];
-    size_t kmp_len = 0;
-    uint8_t iv_c2s[12], iv_s2c[12], key_c2s[32], key_s2c[32];
-    uint8_t q_s[32]; size_t q_s_len = 0;
-    const uint8_t *qc = NULL; uint32_t qc_len = 0;
-    uint8_t ksblob[128]; size_t ks_len = 0;
+/* end of every do_kex: abort/destroy what is live, then zero the context */
+static void kex_ctx_wipe(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    if (k->hop_live) psa_hash_abort(&k->hop);
+    if (k->eph) psa_destroy_key(k->eph);
+    wipe(k, sizeof *k);
+}
 
-    /* our KEXINIT */
-    size_t klen = build_kexinit(kexinit_buf, sizeof kexinit_buf);
-    if (!klen || send_packet(s, kexinit_buf, klen)) goto out;
+/* our KEXINIT (I_S, kept for H) */
+static LSSH_MUST_CHECK int kex_send_init(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    k->klen = build_kexinit(k->kexinit, sizeof k->kexinit);
+    if (!k->klen || send_packet(s, k->kexinit, k->klen)) return -1;
+    return 0;
+}
 
-    /* client KEXINIT (already consumed by the caller on the rekey path) */
-    while (!ck){
+/* client KEXINIT (already consumed by the caller on the rekey path) */
+static LSSH_MUST_CHECK int kex_recv_init(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    while (!k->ck){
         const uint8_t *pl; size_t pn;
-        if (recv_packet(s, &pl, &pn)) goto out;
-        if (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG){ skipped = true; continue; }
+        if (recv_packet(s, &pl, &pn)) return -1;
+        if (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG){ k->skipped = true; continue; }
         if (pl[0] != SSH_MSG_KEXINIT){
             send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "expected KEXINIT");
-            goto out;
+            return -1;
         }
-        ck = pl; ckn = pn;
+        k->ck = pl; k->ckn = pn;
     }
 
-    bool guess_follows = false, client_strict = false, guess_ok = false;
-    if (check_client_kexinit(ck, ckn, &guess_follows, &client_strict, &guess_ok)){
+    if (check_client_kexinit(k->ck, k->ckn, &k->guess_follows, &k->client_strict,
+                             &k->guess_ok)){
         send_disconnect(s, SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
                         "no common algorithms (littlessh offers curve25519-sha256 / "
                         "ecdsa-sha2-nistp256 / aes256-gcm@openssh.com)");
-        goto out;
+        return -1;
     }
-    if (initial && client_strict){
+    if (k->initial && k->client_strict){
         /* strict KEX: KEXINIT must be the very first packet */
-        if (skipped){
+        if (k->skipped){
             send_disconnect(s, SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
                             "strict KEX: KEXINIT was not the first packet");
-            goto out;
+            return -1;
         }
         s->strict_kex = true;
     }
+    return 0;
+}
 
-    /* start H while I_C is still in the receive buffer */
-    if (psa_hash_setup(&hop, PSA_ALG_SHA_256) != PSA_SUCCESS) goto out;
-    hop_live = true;
-    hash_string(&hop, (const uint8_t*)s->v_c, strlen(s->v_c));
-    hash_string(&hop, (const uint8_t*)LSSH_IDENT, strlen(LSSH_IDENT));
-    hash_string(&hop, ck, ckn);
-    hash_string(&hop, kexinit_buf, klen);
+/* start H while I_C is still in the receive buffer */
+static LSSH_MUST_CHECK int kex_hash_start(lssh_session_t *s){
+    static const psa_hash_operation_t hop_init = PSA_HASH_OPERATION_INIT;
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    LSSH_ASSERT(k->ck != NULL && !k->hop_live);
+    k->hop = hop_init;
+    if (psa_hash_setup(&k->hop, PSA_ALG_SHA_256) != PSA_SUCCESS) return -1;
+    k->hop_live = true;
+    hash_string(&k->hop, (const uint8_t*)s->v_c, strlen(s->v_c));
+    hash_string(&k->hop, (const uint8_t*)LSSH_IDENT, strlen(LSSH_IDENT));
+    hash_string(&k->hop, k->ck, k->ckn);
+    hash_string(&k->hop, k->kexinit, k->klen);
+    return 0;
+}
 
-    /* generate ephemeral X25519 pair */
+/* generate ephemeral X25519 pair */
+static LSSH_MUST_CHECK int kex_ephemeral(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    LSSH_ASSERT(k->eph == 0);
     psa_key_attributes_t a = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&a, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_MONTGOMERY));
     psa_set_key_bits(&a, 255);
     psa_set_key_algorithm(&a, PSA_ALG_ECDH);
     psa_set_key_usage_flags(&a, PSA_KEY_USAGE_DERIVE);
-    if (psa_generate_key(&a, &eph) != PSA_SUCCESS) goto out;
+    if (psa_generate_key(&a, &k->eph) != PSA_SUCCESS) return -1;
 
-    if (psa_export_public_key(eph, q_s, 32, &q_s_len) != PSA_SUCCESS || q_s_len != 32)
-        goto out;
+    size_t q_s_len = 0;
+    if (psa_export_public_key(k->eph, k->q_s, 32, &q_s_len) != PSA_SUCCESS || q_s_len != 32)
+        return -1;
+    return 0;
+}
 
-    /* wait for KEX_ECDH_INIT (discarding a wrong guessed packet if flagged) */
-    {
-        bool discard_one = guess_follows && !guess_ok;
-        for (;;){
-            const uint8_t *pl; size_t pn;
-            if (recv_packet(s, &pl, &pn)) goto out;
-            if (discard_one){ discard_one = false; continue; }
-            if (!s->strict_kex &&
-                (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG)) continue;
-            if (pl[0] != SSH_MSG_KEX_ECDH_INIT){
-                send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "expected ECDH_INIT");
-                goto out;
-            }
-            rdr_t r; rd_init(&r, pl, pn); uint8_t m; rd_u8(&r,&m);
-            if (!rd_string(&r, &qc, &qc_len) || qc_len != 32){
-                send_disconnect(s, SSH_DISCONNECT_KEY_EXCHANGE_FAILED, "bad Q_C");
-                goto out;
-            }
-            break;
+/* wait for KEX_ECDH_INIT (discarding a wrong guessed packet if flagged) */
+static LSSH_MUST_CHECK int kex_recv_ecdh_init(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    bool discard_one = k->guess_follows && !k->guess_ok;
+    for (;;){
+        const uint8_t *pl; size_t pn;
+        if (recv_packet(s, &pl, &pn)) return -1;
+        if (discard_one){ discard_one = false; continue; }
+        if (!s->strict_kex &&
+            (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG)) continue;
+        if (pl[0] != SSH_MSG_KEX_ECDH_INIT){
+            send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "expected ECDH_INIT");
+            return -1;
         }
+        rdr_t r; rd_init(&r, pl, pn); uint8_t m; rd_u8(&r,&m);
+        const uint8_t *qc = NULL; uint32_t qc_len = 0;
+        if (!rd_string(&r, &qc, &qc_len) || qc_len != 32){
+            send_disconnect(s, SSH_DISCONNECT_KEY_EXCHANGE_FAILED, "bad Q_C");
+            return -1;
+        }
+        memcpy(k->q_c, qc, 32);
+        return 0;
     }
+}
 
-    /* X25519 shared secret */
+/* X25519 shared secret, and K as mpint bytes (RFC 8731: output interpreted
+ * as big-endian integer) */
+static LSSH_MUST_CHECK int kex_shared_secret(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    LSSH_ASSERT(k->eph != 0);
     size_t sec_len = 0;
-    if (psa_raw_key_agreement(PSA_ALG_ECDH, eph, qc, 32,
-                              secret, 32, &sec_len) != PSA_SUCCESS || sec_len != 32)
-        goto out;
-    {   /* reject all-zero output (low-order point) */
-        uint8_t z = 0;
-        for (int i = 0; i < 32; i++) z |= secret[i];
-        if (!z){ send_disconnect(s, SSH_DISCONNECT_KEY_EXCHANGE_FAILED, "bad point"); goto out; }
-    }
+    if (psa_raw_key_agreement(PSA_ALG_ECDH, k->eph, k->q_c, 32,
+                              k->secret, 32, &sec_len) != PSA_SUCCESS || sec_len != 32)
+        return -1;
+    uint8_t z = 0;   /* reject all-zero output (low-order point) */
+    for (int i = 0; i < 32; i++) z |= k->secret[i];
+    if (!z){ send_disconnect(s, SSH_DISCONNECT_KEY_EXCHANGE_FAILED, "bad point"); return -1; }
 
-    /* K as mpint bytes (RFC 8731: output interpreted as big-endian integer) */
-    {
-        wtr_t w; wr_init(&w, kmp, sizeof kmp);
-        wr_mpint(&w, secret, 32);
-        if (w.err) goto out;
-        kmp_len = w.len;
-    }
+    wtr_t w; wr_init(&w, k->kmp, sizeof k->kmp);
+    wr_mpint(&w, k->secret, 32);
+    if (w.err) return -1;
+    k->kmp_len = w.len;
+    return 0;
+}
 
-    /* host key blob */
-    {
-        wtr_t w; wr_init(&w, ksblob, sizeof ksblob);
-        wr_cstr(&w, HOSTKEY_TYPE);
-        wr_cstr(&w, HOSTKEY_CURVE);
-        wr_string(&w, s->hostkey_pub, 65);
-        if (w.err) goto out;
-        ks_len = w.len;
-    }
+/* host key blob, then finish the exchange hash H */
+static LSSH_MUST_CHECK int kex_finish_hash(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    LSSH_ASSERT(k->hop_live && k->kmp_len <= sizeof k->kmp);
+    wtr_t w; wr_init(&w, k->ksblob, sizeof k->ksblob);
+    wr_cstr(&w, HOSTKEY_TYPE);
+    wr_cstr(&w, HOSTKEY_CURVE);
+    wr_string(&w, s->hostkey_pub, 65);
+    if (w.err) return -1;
+    k->ks_len = w.len;
 
-    /* finish the exchange hash H */
-    {
-        hash_string(&hop, ksblob, ks_len);
-        hash_string(&hop, qc, 32);
-        hash_string(&hop, q_s, 32);
-        psa_hash_update(&hop, kmp, kmp_len);   /* kmp already has length prefix */
-        size_t olen = 0;
-        hop_live = false;
-        if (psa_hash_finish(&hop, H, 32, &olen) != PSA_SUCCESS || olen != 32) goto out;
-    }
-    if (!s->have_sid){ memcpy(s->session_id, H, 32); s->have_sid = true; }
+    hash_string(&k->hop, k->ksblob, k->ks_len);
+    hash_string(&k->hop, k->q_c, 32);
+    hash_string(&k->hop, k->q_s, 32);
+    psa_hash_update(&k->hop, k->kmp, k->kmp_len);   /* kmp already has length prefix */
+    size_t olen = 0;
+    k->hop_live = false;
+    if (psa_hash_finish(&k->hop, k->H, 32, &olen) != PSA_SUCCESS || olen != 32) return -1;
+    if (!s->have_sid){ memcpy(s->session_id, k->H, 32); s->have_sid = true; }
+    return 0;
+}
 
-    /* sign H with the host key: ECDSA-SHA256 over H */
-    uint8_t h2[32], rs[64]; size_t rs_len = 0;
-    if (sha256(H, 32, h2)) goto out;
+/* sign H with the host key (ECDSA-SHA256 over H), send KEX_ECDH_REPLY */
+static LSSH_MUST_CHECK int kex_send_reply(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    LSSH_ASSERT(k->ks_len > 0 && k->ks_len <= sizeof k->ksblob);
+    size_t rs_len = 0;
+    if (sha256(k->H, 32, k->h2)) return -1;
     if (psa_sign_hash(s->hostkey, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
-                      h2, 32, rs, sizeof rs, &rs_len) != PSA_SUCCESS || rs_len != 64)
-        goto out;
+                      k->h2, 32, k->rs, sizeof k->rs, &rs_len) != PSA_SUCCESS || rs_len != 64)
+        return -1;
 
-    /* KEX_ECDH_REPLY */
-    {
-        uint8_t sigblob[160]; wtr_t sw; wr_init(&sw, sigblob, sizeof sigblob);
-        wr_cstr(&sw, HOSTKEY_TYPE);
-        uint8_t rsmp[80]; wtr_t mw; wr_init(&mw, rsmp, sizeof rsmp);
-        wr_mpint(&mw, rs, 32);
-        wr_mpint(&mw, rs+32, 32);
-        if (mw.err) goto out;
-        wr_string(&sw, rsmp, mw.len);
-        if (sw.err) goto out;
+    wtr_t sw; wr_init(&sw, k->sigblob, sizeof k->sigblob);
+    wr_cstr(&sw, HOSTKEY_TYPE);
+    wtr_t mw; wr_init(&mw, k->rsmp, sizeof k->rsmp);
+    wr_mpint(&mw, k->rs, 32);
+    wr_mpint(&mw, k->rs+32, 32);
+    if (mw.err) return -1;
+    wr_string(&sw, k->rsmp, mw.len);
+    if (sw.err) return -1;
 
-        uint8_t reply[384]; wtr_t w; wr_init(&w, reply, sizeof reply);
-        wr_u8(&w, SSH_MSG_KEX_ECDH_REPLY);
-        wr_string(&w, ksblob, ks_len);
-        wr_string(&w, q_s, 32);
-        wr_string(&w, sigblob, sw.len);
-        if (w.err || send_packet(s, reply, w.len)) goto out;
-    }
+    wtr_t w; wr_init(&w, k->reply, sizeof k->reply);
+    wr_u8(&w, SSH_MSG_KEX_ECDH_REPLY);
+    wr_string(&w, k->ksblob, k->ks_len);
+    wr_string(&w, k->q_s, 32);
+    wr_string(&w, k->sigblob, sw.len);
+    if (w.err || send_packet(s, k->reply, w.len)) return -1;
+    return 0;
+}
 
-    /* NEWKEYS both directions */
-    {
-        uint8_t nk = SSH_MSG_NEWKEYS;
-        if (send_packet(s, &nk, 1)) goto out;
-        for (;;){
-            const uint8_t *pl; size_t pn;
-            if (recv_packet(s, &pl, &pn)) goto out;
-            if (!s->strict_kex &&
-                (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG)) continue;
-            if (pl[0] != SSH_MSG_NEWKEYS){
-                send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "expected NEWKEYS");
-                goto out;
-            }
-            break;
+/* NEWKEYS both directions */
+static LSSH_MUST_CHECK int kex_newkeys(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    LSSH_ASSERT(s->have_sid);
+    uint8_t nk = SSH_MSG_NEWKEYS;
+    if (send_packet(s, &nk, 1)) return -1;
+    for (;;){
+        const uint8_t *pl; size_t pn;
+        if (recv_packet(s, &pl, &pn)) return -1;
+        if (!s->strict_kex &&
+            (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG)) continue;
+        if (pl[0] != SSH_MSG_NEWKEYS){
+            send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "expected NEWKEYS");
+            return -1;
         }
+        return 0;
     }
+}
 
-    /* derive and install keys */
-    if (kdf(kmp, kmp_len, H, s->session_id, 'A', iv_c2s, 12) ||
-        kdf(kmp, kmp_len, H, s->session_id, 'B', iv_s2c, 12) ||
-        kdf(kmp, kmp_len, H, s->session_id, 'C', key_c2s, 32) ||
-        kdf(kmp, kmp_len, H, s->session_id, 'D', key_s2c, 32)) goto out;
-    if (import_gcm_key(&s->k_in, key_c2s, true) ||
-        import_gcm_key(&s->k_out, key_s2c, false)) goto out;
-    memcpy(s->iv_in, iv_c2s, 12);
-    memcpy(s->iv_out, iv_s2c, 12);
+/* derive and install keys */
+static LSSH_MUST_CHECK int kex_install(lssh_session_t *s){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    LSSH_ASSERT(s->have_sid && k->kmp_len > 0);
+    if (kdf(k->kmp, k->kmp_len, k->H, s->session_id, 'A', k->iv_c2s, 12) ||
+        kdf(k->kmp, k->kmp_len, k->H, s->session_id, 'B', k->iv_s2c, 12) ||
+        kdf(k->kmp, k->kmp_len, k->H, s->session_id, 'C', k->key_c2s, 32) ||
+        kdf(k->kmp, k->kmp_len, k->H, s->session_id, 'D', k->key_s2c, 32)) return -1;
+    if (import_gcm_key(&s->k_in, k->key_c2s, true) ||
+        import_gcm_key(&s->k_out, k->key_s2c, false)) return -1;
+    memcpy(s->iv_in, k->iv_c2s, 12);
+    memcpy(s->iv_out, k->iv_s2c, 12);
     s->enc = true;
     if (s->strict_kex){ s->seq_in = 0; s->seq_out = 0; }
-    rc = 0;
-out:
-    if (hop_live) psa_hash_abort(&hop);
-    if (eph) psa_destroy_key(eph);
-    wipe(secret, sizeof secret);
-    wipe(kmp, sizeof kmp);
-    wipe(key_c2s, sizeof key_c2s); wipe(key_s2c, sizeof key_s2c);
-    wipe(iv_c2s, sizeof iv_c2s);   wipe(iv_s2c, sizeof iv_s2c);
-    if (rc && !s->dead)
+    return 0;
+}
+
+/* Run a key exchange. If client_kexinit != NULL the client's KEXINIT was
+ * already consumed by the caller (rekey path). */
+static LSSH_MUST_CHECK int do_kex(lssh_session_t *s, const uint8_t *client_kexinit, size_t ck_len){
+    LSSH_ASSERT(s != NULL);
+    kex_ctx_t *k = &s->kex;
+    LSSH_ASSERT(!k->hop_live && k->eph == 0);   /* the last exchange wiped it */
+    k->initial = !s->have_sid;
+    k->ck = client_kexinit; k->ckn = ck_len;
+    bool fail = kex_send_init(s) || kex_recv_init(s) || kex_hash_start(s) ||
+                kex_ephemeral(s) || kex_recv_ecdh_init(s) || kex_shared_secret(s) ||
+                kex_finish_hash(s) || kex_send_reply(s) || kex_newkeys(s) ||
+                kex_install(s);
+    kex_ctx_wipe(s);
+    if (fail && !s->dead)
         send_disconnect(s, SSH_DISCONNECT_KEY_EXCHANGE_FAILED, "kex failed");
-    return rc;
+    return fail ? -1 : 0;
 }
 
 /* ------------------------------------------------------------- userauth */
