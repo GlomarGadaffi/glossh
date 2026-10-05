@@ -2,15 +2,19 @@
 """Power-of-10 rules that clang-tidy and cppcheck cannot express (tools/lint.sh).
 
 usage:
-  p10_check.py source ROOT FILE...
-      Raw-text rules over the littlessh/ files themselves.
+  p10_check.py source ROOT FILE... [--raw FILE...] [--links PATH...]
+      Raw-text rules over the littlessh/ .c/.h files; --raw files (any other
+      regular file under ROOT) get only the suppression-comment scan; --links
+      (symlinks under ROOT) are reported.
   p10_check.py pp ROOT --config NAME --allow "NAME..." --cc CC FILE... -- CCARG...
       Runs `CC -E` on every FILE and applies the preprocessed-source rules to
       the text the linemarkers attribute to files under ROOT.
-  p10_check.py psa-names FILE...
-      Prints every psa_* identifier called in FILE..., one per line (the
-      warn_unused_result shim that tools/lint.sh force-includes into
-      clang-tidy is generated from this list).
+  p10_check.py shim ROOT --allow-drop "NAME..." --cc CC FILE... -- CCARG...
+      Prints the warn_unused_result shim lint.sh force-includes into
+      clang-tidy: the system headers FILE... include (by their spelling), then
+      a warn_unused_result redeclaration of every non-void function those
+      headers declare that littlessh's preprocessed text names, minus
+      --allow-drop (default-deny; see make_shim in lint.sh).
 
 Every finding is one line, FILE:LINE:COL: error: MESSAGE [ID], so lint.sh
 counts these exactly like clang-tidy and cppcheck output. Exit status: 0 no
@@ -22,16 +26,30 @@ newline splices joined, so split-line forms are seen as the compiler sees them;
 the suppression-comment rule reads the raw text, because NOLINT lives in comments):
   p10-suppression     NOLINT*, cppcheck-suppress, any #pragma but "once",
                       _Pragma, __pragma, #line and raw linemarker directives
+  p10-digraph         %: <: :> <% %> (they spell #, [, ], {, } past every
+                      text rule)
   p10-if-constant     #if/#elif whose condition has no identifier (#if 0,
-                      #if (1), #elif !0) or a literal operand of || / &&
+                      #if (1), #elif !0) or a literal operand of || / &&;
+                      if/while/for/switch on a constant (C level, e.g. if (0))
+  p10-config-probe    compiler/tool identity macros anywhere (__clang__,
+                      __GNUC_MINOR__, __OPTIMIZE__, __has_include, LSSH_LINT_*,
+                      ...), and any #if/#ifdef/#elif identifier other than
+                      ESP_PLATFORM, CONFIG_*, __cplusplus or an object-like
+                      macro littlessh defines from those and literals
   p10-macro-braces    a #define body holding { or } that is not exactly
-                      do { ... } while (0)
+                      do { ... } while (0); a brace that is not properly
+                      nested in ( ) / [ ] (a brace passed as a macro argument,
+                      a statement expression)
   p10-macro-comma     a comma operator inside a #define body (clang's -Wcomma
                       is silent inside macro expansions)
   p10-ternary-call    a call in either arm of ?: (one arm cast to void or
                       assigned hides an unchecked result from every compiler
                       diagnostic, so arms may not call at all)
-  p10-goto            goto, setjmp/longjmp and their variants
+  p10-goto            goto, setjmp/longjmp and their variants, ucontext
+                      (get/set/make/swapcontext), __builtin_eh_return
+  p10-generic         _Generic (an unselected association is never evaluated)
+  p10-cleanup-attr    __attribute__((cleanup)) (hidden call at scope exit)
+  p10-include         #include of anything but a .h; a symlink under ROOT
   p10-assert-def      LSSH_ASSERT defined exactly once, as assert(param);
                       no bare assert(), no #define/#undef assert, no
                       #define NDEBUG, no #undef LSSH_ASSERT
@@ -43,14 +61,28 @@ tools/stubs/assert-mark first on the include path, whose assert.h turns every
 assert(e) into lssh_lint_assert_mark_(e), so only asserts that survive the
 #if arms of that configuration are counted, and only if LSSH_ASSERT really
 expands to assert()):
-  p10-goto            goto / setjmp / longjmp after macro expansion
+  p10-goto            goto / setjmp / longjmp / ucontext after macro expansion
+  p10-generic, p10-cleanup-attr, p10-if-constant (C level), p10-ternary-call
+                      as in source, after macro expansion (macro-hidden forms,
+                      parenthesized callees such as (psa_x)(k))
+  p10-macro-braces    a statement expression ( ({ ... }) ) after expansion
   p10-suppression     a #pragma that reached the preprocessor output from a
-                      littlessh/ file (spliced #pragma, _Pragma in a macro)
+                      littlessh/ file (spliced #pragma, _Pragma in a macro); a
+                      linemarker that moves littlessh/ text to another file
+                      (outside an #include entry or return)
+  p10-include         a file compiled as littlessh/ text that is not one of
+                      the linted .c/.h files (symlink, '..' path, .inc)
+  p10-decl-shape      a file-scope { } whose head is not a function
+                      declarator, an initializer or a struct/union/enum (a
+                      K&R definition): the pp rules could not see it
   p10-must-check      every function defined under ROOT with a non-void
                       return type carries warn_unused_result on its FIRST
-                      declaration in the translation unit (clang checks a call
-                      against the declaration visible there, and attributes
-                      only propagate forward; allowlist: --allow)
+                      declaration in the translation unit, and that first
+                      mention is a declaration the gate can read (one
+                      declarator, a prototype); allowlist: --allow
+  p10-function-lines  a function body over 60 lines, or whose braces come
+                      from different files (clang's size check skips bodies
+                      whose braces come from macro expansions)
   p10-assert-missing  every function defined under ROOT has >= 1 assert
   p10-assert-density  per translation unit, asserts / functions >= 2.0
   p10-assert-constant an assert whose argument names no identifier
@@ -60,15 +92,31 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 MIN_DENSITY = 2.0
+MAX_FN_LINES = 60
 MARK = 'lssh_lint_assert_mark_'
 
 IDENT_END_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*$')
 CALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\(')
-GOTO_RE = re.compile(r'\bgoto\b|\b[A-Za-z0-9_]*(?:setjmp|longjmp)[A-Za-z0-9_]*\b')
+PAREN_CALL_RE = re.compile(r'\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\(')
+GOTO_RE = re.compile(r'\bgoto\b|\b[A-Za-z0-9_]*(?:setjmp|longjmp)[A-Za-z0-9_]*\b'
+                     r'|\b(?:get|set|make|swap)context\b'
+                     r'|\b__builtin_(?:unwind_init|eh_return)\b')
+GENERIC_RE = re.compile(r'\b_Generic\b')
+DIGRAPH_RE = re.compile(r'%:|<:|:>|<%|%>')
 NUMBER_RE = re.compile(r'(?<![A-Za-z0-9_])\.?\d[A-Za-z0-9_.]*')
 WORD_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+COND_RE = re.compile(r'\b(if|while|for|switch)\s*\(')
+# Macros that tell one compiler, analyser or build mode from another. Code
+# that tests them can hide itself from the analyser that owns a rule.
+PROBE_RE = re.compile(
+    r'\b(__clang\w*|__llvm\w*|__GNUC\w*|__GNUG__|__CPPCHECK__|__cppcheck__'
+    r'|__COVERITY\w*|__INTEL\w*|_MSC_\w+|__OPTIMIZE\w*|__NO_INLINE__'
+    r'|__has_\w+|__VERSION__|__INCLUDE_LEVEL__|__COUNTER__|__BASE_FILE__'
+    r'|__TIMESTAMP__|__SANITIZE\w*|LSSH_LINT_\w*|__ESP_LOG_H__)\b')
+IF_ALLOWED_BASE = {'ESP_PLATFORM', '__cplusplus'}
 
 # Words that look like a call or an identifier but are not one.
 NOT_CALLS = {'sizeof', '_Alignof', 'alignof', '__alignof__', 'offsetof',
@@ -84,6 +132,7 @@ SPEC_WORDS = {'static', 'extern', 'inline', '__inline', '__inline__',
 ATTR_RE = re.compile(r'\b(__attribute__|__attribute|__asm__|__asm|asm|'
                      r'__declspec|_Alignas)\s*\(')
 MUST_CHECK_ATTR_RE = re.compile(r'\b(warn_unused_result|__warn_unused_result__)\b')
+CLEANUP_RE = re.compile(r'\b(cleanup|__cleanup__)\s*\(')
 
 
 class Findings:
@@ -92,6 +141,7 @@ class Findings:
         self.lines = []
 
     def add(self, path, line, col, ident, msg):
+        path = os.path.normpath(path)
         key = (path, line, col, ident, msg)
         if key in self.seen:
             return
@@ -202,6 +252,44 @@ def strip_attrs(s):
         i = balanced_end(s, m.end() - 1)
 
 
+def depth0(s, chars):
+    """Offsets in s of any of chars outside every ( ) and [ ]."""
+    hits = []
+    depth = 0
+    for k, c in enumerate(s):
+        if c in '([':
+            depth += 1
+        elif c in ')]':
+            depth -= 1
+        elif depth == 0 and c in chars:
+            hits.append(k)
+    return hits
+
+
+def must_check_attr(text):
+    """True when warn_unused_result appears inside an __attribute__ group
+    that is not inside any parentheses of the declarator (so not on a
+    parameter, and never as a parameter's name)."""
+    depth = 0
+    i, n = 0, len(text)
+    while i < n:
+        m = ATTR_RE.match(text, i)
+        if m and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == '_')):
+            e = balanced_end(text, m.end() - 1)
+            if (depth == 0 and m.group(1).startswith('__attribute')
+                    and MUST_CHECK_ATTR_RE.search(text[m.end():e])):
+                return True
+            i = e
+            continue
+        c = text[i]
+        if c in '([':
+            depth += 1
+        elif c in ')]':
+            depth -= 1
+        i += 1
+    return False
+
+
 def parse_head(head):
     """'static int __attribute__((x)) foo(int a)' -> ('foo', 'int').
     Returns (None, None) when the head is not a plain function declarator."""
@@ -225,10 +313,25 @@ def parse_head(head):
     return None, None
 
 
+def head_kind(head):
+    """Classify what precedes a file-scope '{': 'fn', 'init' or 'aggr', or
+    'bad' when it is none of them (a K&R definition leaves an empty head)."""
+    s = strip_attrs(head).strip()
+    if depth0(s, '='):
+        return 'init'
+    if s.endswith(')') and '(' in s:
+        return 'fn'
+    if re.search(r'\b(struct|union|enum)\b', s):
+        return 'aggr'
+    return 'bad'
+
+
 def items(code):
     """Yield file-scope items of preprocessed, blanked C:
     ('def', head, head_start, body_start, body) for a function definition,
-    ('decl', text, start) for anything ending in ';'."""
+    ('bad', ...) the same for a brace block that is no function, initializer
+    or aggregate, ('init', ...) / ('aggr', ...) for those, ('decl', text,
+    start) for anything ending in ';'."""
     depth = 0
     seg = 0
     i, n = 0, len(code)
@@ -236,9 +339,7 @@ def items(code):
         c = code[i]
         if c == '{' and depth == 0:
             head = code[seg:i]
-            stripped = strip_attrs(head).rstrip()
-            is_fn = (stripped.endswith(')') and '(' in stripped
-                     and '=' not in stripped)
+            kind = head_kind(head)
             start = i
             depth = 1
             i += 1
@@ -250,8 +351,10 @@ def items(code):
                 i += 1
             if depth:
                 raise ValueError(start, 'unbalanced braces')
-            if is_fn:
+            if kind == 'fn':
                 yield ('def', head, seg, start, code[start:i])
+            else:
+                yield (kind, head, seg, start, code[start:i])
             seg = i
             continue
         if c == '}' and depth == 0:
@@ -311,14 +414,95 @@ def ternary_arms(text, q):
     return [(q + 1, colon), (colon + 1, j)]
 
 
-def calls_in(s):
-    return [m.group(1) for m in CALL_RE.finditer(s)
-            if m.group(1) not in NOT_CALLS]
+def calls_in(s, fnames=()):
+    """Names called in s: name( and, for a known function name, (name)(."""
+    out = [m.group(1) for m in CALL_RE.finditer(s) if m.group(1) not in NOT_CALLS]
+    out += [m.group(1) for m in PAREN_CALL_RE.finditer(s) if m.group(1) in fnames]
+    return out
 
 
 def has_identifier(expr):
     words = WORD_RE.findall(NUMBER_RE.sub(' ', expr))
     return any(w not in NOT_IDENTS for w in words)
+
+
+def bracket_faults(code):
+    """(offset, message) for every brace that is not properly nested with
+    ( ) and [ ] in directive-free code: a '{' inside parentheses that is not
+    a compound literal's, or a bracket closing the wrong opener. In real C
+    these only arise from braces passed as macro arguments (RA_ID(}),
+    M({, }, x)) or from statement expressions."""
+    out = []
+    stack = []
+    pairs = {')': '(', ']': '[', '}': '{'}
+    for k, c in enumerate(code):
+        if c in '([':
+            stack.append(c)
+        elif c == '{':
+            if stack and stack[-1] in '([':
+                j = k - 1
+                while j >= 0 and code[j] in ' \t\n':
+                    j -= 1
+                if j < 0 or code[j] != ')':
+                    out.append((k, "'{' inside ( ) or [ ]: a brace passed as a macro "
+                                   "argument or a statement expression"))
+            stack.append('{')
+        elif c in pairs:
+            if stack and stack[-1] == pairs[c]:
+                stack.pop()
+                continue
+            out.append((k, "'%s' closes %s: braces passed as macro arguments "
+                           "or unbalanced brackets" % (c, "'%s'" % stack[-1] if stack else 'nothing')))
+            if pairs[c] in stack:
+                while stack and stack.pop() != pairs[c]:
+                    pass
+    return out
+
+
+def literal_conditions(code):
+    """(offset, message) for if/while/for/switch whose condition is a
+    constant. `} while (0)` (the do/while(0) tail) and while (1)/(true)
+    (an endless loop: rule 2, not checked here) are left alone."""
+    out = []
+    for m in COND_RE.finditer(code):
+        kw = m.group(1)
+        k = m.end() - 1
+        e = balanced_end(code, k)
+        cond = code[k + 1:e - 1]
+        if kw == 'for':
+            parts = depth0(cond, ';')
+            if len(parts) != 2:
+                continue
+            cond = cond[parts[0] + 1:parts[1]]
+            if not cond.strip():
+                continue
+        c = ' '.join(cond.split())
+        if kw == 'while':
+            if c in ('1', 'true', '(1)'):
+                continue
+            j = m.start() - 1
+            while j >= 0 and code[j] in ' \t\n':
+                j -= 1
+            if j >= 0 and code[j] == '}' and c in ('0', '(0)'):
+                continue
+        msg = if_constant(cond)
+        if msg:
+            out.append((m.start(), "%s (%s) on a constant condition: code behind "
+                                   "it is dead or the test is pointless" % (kw, c)))
+    return out
+
+
+def cleanup_attrs(code):
+    """Offsets of a cleanup attribute inside __attribute__((...))."""
+    out = []
+    for m in ATTR_RE.finditer(code):
+        if not m.group(1).startswith('__attribute'):
+            continue
+        e = balanced_end(code, m.end() - 1)
+        c = CLEANUP_RE.search(code, m.end(), e)
+        if c:
+            out.append(c.start())
+    return out
 
 
 # ---------------------------------------------------------- source rules
@@ -337,8 +521,10 @@ SUPPRESS_CODE = [
 DIRECTIVE_RE = re.compile(r'^\s*#\s*([A-Za-z_]+)\b(.*)$')
 DEFINE_RE = re.compile(r'\s*([A-Za-z_][A-Za-z0-9_]*)(\([^)]*\))?(.*)$', re.S)
 DO_WHILE0_RE = re.compile(r'\s*do\s*\{.*\}\s*while\s*\(\s*0\s*\)\s*', re.S)
+INCLUDE_H_RE = re.compile(r'\s*#\s*include\s*(<[^>]*\.h>|"[^"]*\.h")\s*(//.*|/\*.*)?$')
 KEYWORD_PARENS = {'if', 'while', 'switch', 'return', 'sizeof', '_Alignof',
                   'alignof', '__alignof__', 'case', 'else', 'do'}
+IF_KWS = ('if', 'elif', 'ifdef', 'ifndef', 'elifdef', 'elifndef')
 
 
 def if_constant(cond):
@@ -420,11 +606,48 @@ def check_ternaries(f, path, text, origin, base=0):
                 break
 
 
-def source(root, files):
+def if_allowed(defs):
+    """Identifiers an #if-family condition may test: IF_ALLOWED_BASE,
+    CONFIG_*, and object-like macros littlessh defines whose every body
+    (all definitions) names only allowed identifiers."""
+    allowed = set(IF_ALLOWED_BASE)
+    fnlike = {name for name, params, _ in defs if params is not None}
+    bodies = {}
+    for name, params, body in defs:
+        bodies.setdefault(name, []).append(body)
+
+    def ok(w):
+        return w in allowed or w.startswith('CONFIG_')
+    changed = True
+    while changed:
+        changed = False
+        for name, bl in bodies.items():
+            if name in allowed or name in fnlike:
+                continue
+            words = [w for b in bl for w in WORD_RE.findall(NUMBER_RE.sub(' ', b))]
+            if all(ok(w) for w in words):
+                allowed.add(name)
+                changed = True
+    return ok
+
+
+def source(root, files, raw_files, links):
     f = Findings()
     assert_defs = []
     must_defs = []
+    all_defs = []      # (name, params or None, body) of every #define
+    if_conds = []      # (path, line, kw, condition)
     first = None
+    for path in links:
+        f.add(path, 1, 1, 'p10-include',
+              'symlink under littlessh/: the source rules do not follow it; '
+              'make it a regular file')
+    for path in raw_files:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            for no, ln in enumerate(fh.read().split('\n'), 1):
+                for rx, msg in SUPPRESS_RAW:
+                    if rx.search(ln):
+                        f.add(path, no, 1, 'p10-suppression', msg)
     for path in files:
         with open(path, encoding='utf-8', errors='replace') as fh:
             raw = fh.read().replace('\r\n', '\n')
@@ -437,6 +660,20 @@ def source(root, files):
                     f.add(rel, no, 1, 'p10-suppression', msg)
         text, origin = splice(raw)
         code = blank(text, keep_directives=True)
+        for m in DIGRAPH_RE.finditer(code):
+            f.add(rel, origin[m.start()], 1, 'p10-digraph',
+                  "digraph '%s' is banned in littlessh/ (it spells a #, bracket or "
+                  "brace the text rules do not see)" % m.group(0))
+        for m in PROBE_RE.finditer(code):
+            f.add(rel, origin[m.start()], 1, 'p10-config-probe',
+                  "'%s' tells one compiler, analyser or build mode from another; "
+                  "code that tests it can hide from the gate" % m.group(0))
+        for m in GENERIC_RE.finditer(code):
+            f.add(rel, origin[m.start()], 1, 'p10-generic',
+                  '_Generic is banned (an unselected association is never evaluated)')
+        for k in cleanup_attrs(code):
+            f.add(rel, origin[k], 1, 'p10-cleanup-attr',
+                  'the cleanup attribute is banned (a hidden call at scope exit)')
         # line offsets of the spliced text
         starts = [0]
         for k, c in enumerate(code):
@@ -462,10 +699,17 @@ def source(root, files):
                 continue
             directive_spans.append((st, end))
             kw, rest = d.group(1), d.group(2)
+            if kw in IF_KWS:
+                if_conds.append((rel, srcline, kw, rest))
             if kw in ('if', 'elif'):
                 msg = if_constant(rest)
                 if msg:
                     f.add(rel, srcline, 1, 'p10-if-constant', msg)
+            elif kw in ('include', 'include_next', 'import'):
+                if kw != 'include' or not INCLUDE_H_RE.match(text[st:end]):
+                    f.add(rel, srcline, 1, 'p10-include',
+                          'only #include <x.h> / "x.h" is allowed in littlessh/ '
+                          '(a non-.h include is compiled but not linted)')
             elif kw == 'undef':
                 name = rest.strip()
                 if name in ('assert', 'LSSH_ASSERT'):
@@ -478,6 +722,7 @@ def source(root, files):
                     f.add(rel, srcline, 1, 'p10-tool-error', 'cannot parse #define')
                     continue
                 name, params, body = m.group(1), m.group(2), m.group(3)
+                all_defs.append((name, params, body))
                 body_off = st + d.start(2) + m.start(3)
                 if ('{' in body or '}' in body) and not DO_WHILE0_RE.fullmatch(body):
                     f.add(rel, srcline, 1, 'p10-macro-braces',
@@ -494,12 +739,17 @@ def source(root, files):
                     assert_defs.append((rel, srcline, params, body, body_off))
                 elif name == 'LSSH_MUST_CHECK':
                     must_defs.append((rel, srcline, params, body))
-        # code outside directives: ternaries and bare assert()
+        # code outside directives: ternaries, bare assert(), brace nesting,
+        # constant conditions
         nodir = list(code)
         for s, e in directive_spans:
             nodir[s:e] = ' ' * (e - s)
         nodir = ''.join(nodir)
         check_ternaries(f, rel, nodir, origin)
+        for k, msg in bracket_faults(nodir):
+            f.add(rel, origin[k], 1, 'p10-macro-braces', msg)
+        for k, msg in literal_conditions(nodir):
+            f.add(rel, origin[k], 1, 'p10-if-constant', msg)
         for m in re.finditer(r'\bassert\s*\(', nodir):
             f.add(rel, origin[m.start()], 1, 'p10-assert-def',
                   'bare assert(): use LSSH_ASSERT so the gate can count it')
@@ -510,6 +760,16 @@ def source(root, files):
             for m in re.finditer(r'\bassert\s*\(', seg):
                 f.add(rel, origin[s + m.start()], 1, 'p10-assert-def',
                       'assert() outside the LSSH_ASSERT definition')
+    ok = if_allowed(all_defs)
+    for rel, line, kw, cond in if_conds:
+        for w in WORD_RE.findall(NUMBER_RE.sub(' ', cond)):
+            if w != 'defined' and not ok(w):
+                f.add(rel, line, 1, 'p10-config-probe',
+                      "#%s tests '%s': only ESP_PLATFORM, CONFIG_*, __cplusplus and "
+                      "object-like macros littlessh defines from those may be tested "
+                      "(anything else can tell the analysers from the real build)"
+                      % (kw, w))
+                break
     where = first or (files[0] if files else '?')
     if len(assert_defs) != 1:
         for rel, line, *_ in assert_defs or [(where, 1)]:
@@ -519,9 +779,9 @@ def source(root, files):
     else:
         rel, line, params, body, _ = assert_defs[0]
         pm = re.fullmatch(r'\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)', params or '')
-        ok = pm and re.fullmatch(r'\s*assert\s*\(\s*(\(\s*)?%s(\s*\))?\s*\)\s*'
-                                 % re.escape(pm.group(1)), body)
-        if not ok:
+        good = pm and re.fullmatch(r'\s*assert\s*\(\s*(\(\s*)?%s(\s*\))?\s*\)\s*'
+                                   % re.escape(pm.group(1)), body)
+        if not good:
             f.add(rel, line, 1, 'p10-assert-def',
                   'LSSH_ASSERT must be defined as LSSH_ASSERT(c) assert(c)')
     if len(must_defs) != 1:
@@ -541,7 +801,9 @@ def source(root, files):
 
 # -------------------------------------------------------------- pp rules
 
-LINEMARK_RE = re.compile(r'^#\s+(\d+)\s+"((?:[^"\\]|\\.)*)"')
+LINEMARK_RE = re.compile(r'^#\s+(\d+)\s+"((?:[^"\\]|\\.)*)"((?:\s+\d+)*)\s*$')
+DIGRAPH_SUBST = [('%:%:', '##  '), ('%:', '# '), ('<%', '{ '), ('%>', '} '),
+                 ('<:', '[ '), (':>', '] ')]
 
 
 def preprocess(cc, args, path):
@@ -551,25 +813,55 @@ def preprocess(cc, args, path):
     return p.returncode, p.stdout, p.stderr
 
 
-def pp_tu(f, root, config, allow, path, pp_text):
-    """Apply the pp rules to one preprocessed translation unit."""
+def user_test(root):
+    """is_user(raw linemarker path): the spelled path, its normalized form or
+    its real path lies under ROOT."""
     rroot = os.path.realpath(root) + os.sep
-    user_cache = {}
+    aroot = os.path.abspath(root) + os.sep
+    cache = {}
 
     def is_user(fn):
-        if fn not in user_cache:
-            user_cache[fn] = os.path.realpath(fn).startswith(rroot)
-        return user_cache[fn]
+        if fn not in cache:
+            cache[fn] = (fn.startswith(aroot)
+                         or os.path.normpath(fn).startswith(aroot)
+                         or os.path.realpath(fn).startswith(rroot))
+        return cache[fn]
+    return is_user
 
+
+def unescape(s):
+    return s.encode().decode('unicode_escape')
+
+
+def pp_tu(f, root, config, allow, path, pp_text, linted):
+    """Apply the pp rules to one preprocessed translation unit. linted is
+    the set of real paths of the .c/.h files the gate lints."""
+    is_user = user_test(root)
     lines = pp_text.split('\n')
     where = []          # (file, line) per output line
     cur, curline = path, 1
+    outside = set()
     for k, ln in enumerate(lines):
         m = LINEMARK_RE.match(ln)
         if m:
             where.append((cur, curline))
+            new = unescape(m.group(2))
+            flags = set(m.group(3).split())
+            if (is_user(cur) and not new.startswith('<') and new != cur
+                    and not flags & {'1', '2'}):
+                f.add(cur, curline, 1, 'p10-suppression',
+                      'a #line/linemarker moved littlessh/ text to %s (%s)' % (new, config))
+            # (flag 3 on a littlessh/ file is normal: gcc marks the tokens
+            # of a system-header macro expanded there)
+            if ('1' in flags and is_user(new) and new not in outside
+                    and os.path.realpath(new) not in linted):
+                outside.add(new)
+                f.add(cur, curline, 1, 'p10-include',
+                      '%s is compiled as littlessh/ code but is not one of the linted '
+                      '.c/.h files (symlink, .. path or other extension) (%s)'
+                      % (new, config))
             curline = int(m.group(1))
-            cur = os.path.normpath(m.group(2).encode().decode('unicode_escape'))
+            cur = new
             lines[k] = ''
             continue
         where.append((cur, curline))
@@ -581,6 +873,8 @@ def pp_tu(f, root, config, allow, path, pp_text):
             lines[k] = ''
         curline += 1
     code = blank('\n'.join(lines), keep_directives=True)
+    for dg, rep in DIGRAPH_SUBST:
+        code = code.replace(dg, rep)
     starts = [0]
     for k, c in enumerate(code):
         if c == '\n':
@@ -588,6 +882,9 @@ def pp_tu(f, root, config, allow, path, pp_text):
 
     def loc(off):
         return where[bisect.bisect_right(starts, off) - 1]
+
+    def user_at(off):
+        return is_user(loc(off)[0])
 
     for k, ln in enumerate(code.split('\n')):
         fn, no = where[k]
@@ -597,38 +894,98 @@ def pp_tu(f, root, config, allow, path, pp_text):
             f.add(fn, no, 1, 'p10-goto',
                   "'%s' after preprocessing (%s) is banned (Power of 10 rule 1)"
                   % (m.group(0), config))
+        for m in GENERIC_RE.finditer(ln):
+            f.add(fn, no, 1, 'p10-generic',
+                  '_Generic after preprocessing (%s) is banned' % config)
+        for m in re.finditer(r'\(\s*\{', ln):
+            f.add(fn, no, 1, 'p10-macro-braces',
+                  'statement expression after preprocessing (%s) is banned' % config)
+    for k in cleanup_attrs(code):
+        if user_at(k):
+            fn, no = loc(k)
+            f.add(fn, no, 1, 'p10-cleanup-attr',
+                  'the cleanup attribute after preprocessing (%s) is banned' % config)
+    for k, msg in literal_conditions(code):
+        if user_at(k):
+            fn, no = loc(k)
+            f.add(fn, no, 1, 'p10-if-constant', '%s, after preprocessing (%s)' % (msg, config))
 
-    # first[name] = (has_attr, offset): the first declaration or definition
-    # of each function in TU order. clang decides -Wunused-result from the
-    # declaration visible at the call, and attributes only propagate forward,
-    # so the attribute must be on the first one.
+    # first[name] = (has_attr, name_offset, span_start, span_end): the first
+    # declaration or definition the gate can read, in TU order. clang
+    # decides -Wunused-result from the declaration visible at the call, and
+    # attributes only propagate forward, so the attribute must be on the
+    # first one, and the first mention of the name must be that one.
     first = {}
     defs = []
 
     def note(text, off, is_def):
-        stripped = strip_attrs(text)
-        if not is_def and '=' in stripped:
+        if not is_def and depth0(strip_attrs(text), '='):
             return
-        name, _ = parse_head(text.strip())
-        if name and name not in first:
-            hits = list(re.finditer(r'\b%s\s*\(' % re.escape(name), text))
-            first[name] = (bool(MUST_CHECK_ATTR_RE.search(text)),
-                           off + (hits[-1].start() if hits else 0))
+        name, ret = parse_head(text.strip())
+        if not name or name in first or 'typedef' in ret.split():
+            return
+        hits = list(re.finditer(r'\b%s\s*\(' % re.escape(name), text))
+        first[name] = (must_check_attr(text),
+                       off + (hits[-1].start() if hits else 0), off, off + len(text))
 
+    aggr = []           # file-scope struct/union/enum bodies (member names)
     try:
         for it in items(code):
             if it[0] == 'decl':
                 note(it[1], it[2], False)
                 continue
+            if it[0] in ('aggr', 'init'):
+                if it[0] == 'aggr':
+                    aggr.append((it[3], it[3] + len(it[4])))
+                continue
+            if it[0] == 'bad':
+                _, head, hstart, bstart, body = it
+                if user_at(bstart):
+                    fn, no = loc(bstart)
+                    f.add(fn, no, 1, 'p10-decl-shape',
+                          'file-scope { } after "%s" is not a prototype-style function, '
+                          'an initializer or a struct/union/enum (K&R definition?): '
+                          'the pp rules cannot see it (%s)'
+                          % (' '.join(head.split())[-50:], config))
+                continue
             _, head, hstart, bstart, body = it
             note(head, hstart, True)
-            if is_user(loc(bstart)[0]):
+            if user_at(bstart):
                 defs.append((head, hstart, bstart, body))
     except ValueError as e:
         fn, no = loc(e.args[0])
         f.add(fn, no, 1, 'p10-tool-error', 'cannot parse preprocessed %s (%s): %s'
               % (path, config, e.args[1]))
         return
+
+    fnames = set(first)
+    for k, c in enumerate(code):
+        if c != '?' or not user_at(k):
+            continue
+        arms = ternary_arms(code, k)
+        if arms is None:
+            continue
+        for s, e in arms:
+            called = calls_in(code[s:e], fnames)
+            if called:
+                fn, no = loc(k)
+                f.add(fn, no, 1, 'p10-ternary-call',
+                      'call to %s() in an arm of ?: after preprocessing (%s)'
+                      % (called[0], config))
+                break
+
+    def first_mention(name):
+        for m in re.finditer(r'\b%s\b' % re.escape(name), code):
+            if not user_at(m.start()):
+                continue
+            pre = code[max(0, m.start() - 16):m.start()]
+            if re.search(r'(\.|->)\s*$|\b(struct|union|enum)\s+$', pre):
+                continue
+            if any(a <= m.start() < b for a, b in aggr):
+                continue
+            return m.start()
+        return None
+
     nfn = nassert = 0
     for head, hstart, bstart, body in defs:
         fn, no = loc(bstart)
@@ -642,11 +999,25 @@ def pp_tu(f, root, config, allow, path, pp_text):
         hits = list(re.finditer(r'\b%s\s*\(' % re.escape(name), head))
         if hits:
             fn, no = loc(hstart + hits[-1].start())
+        bend = loc(bstart + len(body) - 1)
+        bbeg = loc(bstart)
+        if bend[0] != bbeg[0] or bend[1] - bbeg[1] > MAX_FN_LINES:
+            f.add(fn, no, 1, 'p10-function-lines',
+                  "function '%s' body spans %s (limit %d) (%s)"
+                  % (name, '%d lines' % (bend[1] - bbeg[1]) if bend[0] == bbeg[0]
+                     else 'two files', MAX_FN_LINES, config))
         if ret != 'void' and name not in allow:
-            has_attr, off = first.get(name, (False, hstart))
-            if not has_attr:
+            has_attr, off, span_s, span_e = first.get(name, (False, hstart, hstart, hstart))
+            mention = first_mention(name)
+            if mention is not None and mention < span_s:
+                mfn, mno = loc(mention)
+                f.add(mfn, mno, 1, 'p10-must-check',
+                      "function '%s' returns '%s' but its first mention is not a "
+                      "declaration the gate can read (one declarator, a prototype, "
+                      "carrying LSSH_MUST_CHECK) (%s)" % (name, ret, config))
+            elif not has_attr:
                 ffn, fno = loc(off)
-                attr_later = bool(MUST_CHECK_ATTR_RE.search(head))
+                attr_later = must_check_attr(head)
                 f.add(ffn, fno, 1, 'p10-must-check',
                       "function '%s' returns '%s' but %s LSSH_MUST_CHECK (%s)"
                       % (name, ret,
@@ -672,28 +1043,32 @@ def pp_tu(f, root, config, allow, path, pp_text):
               % (nfn, nassert, nassert / nfn, MIN_DENSITY, config))
 
 
-def pp(argv):
-    if '--' not in argv:
-        print(__doc__.strip().splitlines()[2], file=sys.stderr)
-        return 2
+def parse_opts(argv, names):
+    """argv = OPTS... -- CCARGS: returns (root, {opt: value}, files, ccargs)."""
     k = argv.index('--')
     opts, ccargs = argv[:k], argv[k + 1:]
-    root = opts[0]
-    config, allow, cc, files = 'default', set(), 'cc', []
+    vals = {}
+    files = []
     j = 1
     while j < len(opts):
-        if opts[j] == '--config':
-            config = opts[j + 1]
-            j += 2
-        elif opts[j] == '--allow':
-            allow = set(opts[j + 1].split())
-            j += 2
-        elif opts[j] == '--cc':
-            cc = opts[j + 1]
+        if opts[j] in names:
+            vals[opts[j]] = opts[j + 1]
             j += 2
         else:
             files.append(opts[j])
             j += 1
+    return opts[0], vals, files, ccargs
+
+
+def pp(argv):
+    if '--' not in argv:
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    root, vals, files, ccargs = parse_opts(argv, ('--config', '--allow', '--cc'))
+    config = vals.get('--config', 'default')
+    allow = set(vals.get('--allow', '').split())
+    cc = vals.get('--cc', 'cc')
+    linted = {os.path.realpath(p) for p in files}
     f = Findings()
     for path in files:
         rc, out, err = preprocess(cc, ccargs, path)
@@ -701,30 +1076,95 @@ def pp(argv):
             sys.stdout.write(err)
             f.add(path, 1, 1, 'p10-tool-error', 'preprocessing failed (%s)' % config)
             continue
-        pp_tu(f, root, config, allow, path, out)
+        pp_tu(f, root, config, allow, path, out, linted)
     return f.emit()
 
 
-def psa_names(files):
-    names = set()
+SYS_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*<([^>]+)>', re.M)
+
+
+def shim(argv):
+    """Print the warn_unused_result shim (see the module docstring)."""
+    if '--' not in argv:
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    root, vals, files, ccargs = parse_opts(argv, ('--allow-drop', '--cc'))
+    cc = vals.get('--cc', 'cc')
+    drop_ok = set(vals.get('--allow-drop', '').split())
+    errors = []
+    headers = []
     for path in files:
         with open(path, encoding='utf-8', errors='replace') as fh:
-            code = blank(splice(fh.read().replace('\r\n', '\n'))[0], keep_directives=False)
-        for m in re.finditer(r'\b(psa_[A-Za-z0-9_]+)\s*\(', code):
-            if not m.group(1).endswith('_t'):
-                names.add(m.group(1))
-    for nm in sorted(names):
-        print(nm)
-    return 0
+            text = blank(splice(fh.read().replace('\r\n', '\n'))[0])
+        for h in SYS_INCLUDE_RE.findall(text):
+            if h not in headers:
+                headers.append(h)
+    inc = ''.join('#if __has_include(<%s>)\n#include <%s>\n#endif\n' % (h, h)
+                  for h in headers)
+    # every non-void function the shim's own includes declare
+    declared = set()
+    with tempfile.TemporaryDirectory() as td:
+        hpath = os.path.join(td, 'lssh_shim_decls.c')
+        with open(hpath, 'w') as fh:
+            fh.write(inc)
+        rc, out, err = preprocess(cc, ccargs, hpath)
+        if rc != 0:
+            errors.append('preprocessing the shim headers failed: %s' % err.strip()[:200])
+        else:
+            code = blank('\n'.join('' if ln.startswith('#') else ln
+                                   for ln in out.split('\n')))
+            try:
+                for it in items(code):
+                    if it[0] not in ('decl', 'def'):
+                        continue
+                    text = it[1]
+                    if it[0] == 'decl' and depth0(strip_attrs(text), '='):
+                        continue
+                    name, ret = parse_head(text.strip())
+                    if name and ret and ret != 'void' and 'typedef' not in ret.split():
+                        declared.add(name)
+            except ValueError as e:
+                errors.append('cannot parse the shim headers: %s' % e.args[1])
+    # every identifier littlessh's own preprocessed lines name
+    is_user = user_test(root)
+    named = set()
+    for path in files:
+        rc, out, err = preprocess(cc, ccargs, path)
+        if rc != 0:
+            errors.append('preprocessing %s failed' % path)
+            continue
+        cur = path
+        for ln in out.split('\n'):
+            m = LINEMARK_RE.match(ln)
+            if m:
+                cur = unescape(m.group(2))
+                continue
+            if is_user(cur) and not ln.lstrip().startswith('#'):
+                named.update(WORD_RE.findall(blank(ln)))
+    print('/* generated by tools/lint.sh (p10_check.py shim); clang-tidy only */')
+    for e in errors:
+        print('#error "lint shim: %s"' % e.replace('"', "'").replace('\n', ' '))
+    sys.stdout.write(inc)
+    for nm in sorted((named & declared) - drop_ok):
+        print('__typeof__(%s) %s __attribute__((warn_unused_result));' % (nm, nm))
+    return 1 if errors else 0
 
 
 def main(argv):
     if len(argv) >= 3 and argv[1] == 'source':
-        return source(argv[2], argv[3:])
+        rest = argv[3:]
+        groups = {'files': [], '--raw': [], '--links': []}
+        cur = 'files'
+        for a in rest:
+            if a in ('--raw', '--links'):
+                cur = a
+            else:
+                groups[cur].append(a)
+        return source(argv[2], groups['files'], groups['--raw'], groups['--links'])
     if len(argv) >= 3 and argv[1] == 'pp':
         return pp(argv[2:])
-    if len(argv) >= 2 and argv[1] == 'psa-names':
-        return psa_names(argv[2:])
+    if len(argv) >= 3 and argv[1] == 'shim':
+        return shim(argv[2:])
     print(__doc__.strip().splitlines()[2], file=sys.stderr)
     return 2
 

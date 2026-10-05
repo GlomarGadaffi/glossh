@@ -5,8 +5,8 @@
  * and cppcheck see real calls. It returns void, like esp_log_write(): a log
  * line is not a result anyone has to check.
  */
-#ifndef LSSH_LINT_STUB_ESP_LOG_H
-#define LSSH_LINT_STUB_ESP_LOG_H
+#ifndef __ESP_LOG_H__ /* the real header's guard: nothing here tells it apart */
+#define __ESP_LOG_H__
 
 void esp_log_write(int level, const char *tag, const char *format, ...)
     __attribute__((format(printf, 3, 4)));

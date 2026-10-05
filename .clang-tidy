@@ -11,10 +11,11 @@
 #                     the line limit being met by packing statements onto lines).
 #   7  check returns  clang-diagnostic-unused-result: every littlessh function
 #                     with a non-void return is LSSH_MUST_CHECK, and lint.sh
-#                     force-includes a shim giving the psa_* calls littlessh makes
-#                     (and the libc calls below) warn_unused_result.
+#                     force-includes a shim giving warn_unused_result to every
+#                     non-void system/psa function littlessh's preprocessed text
+#                     names (default-deny; lint.sh DROP_OK lists the exceptions).
 #                     bugprone-unused-return-value for ^::psa_.*, ^::rd_.* and the
-#                     POSIX calls littlessh makes; cert-err33-c for the rest of libc.
+#                     POSIX calls below; cert-err33-c for the ISO C table.
 #                     An explicit (void) cast is the only accepted way to drop one.
 #                     clang-diagnostic-unused-value / -unused-comparison: results
 #                     computed and thrown away; clang-diagnostic-comma (-Wcomma):
@@ -23,6 +24,8 @@
 #                     CheckedReturnTypes '^::psa_status_t$' was tried and dropped:
 #                     clang-tidy 19 accepts it but matches the canonical type
 #                     (int), so it never fires.
+#   -  K&R defs      clang-diagnostic-deprecated-non-prototype: a K&R definition
+#                     hides its function from the p10 pp rules.
 #   -  switch default bugprone-switch-missing-default-case (non-enum selectors),
 #                     clang-diagnostic-switch-default (-Wswitch-default, every
 #                     switch, enum selectors too) and clang-diagnostic-switch.
@@ -46,7 +49,8 @@ Checks: >-
   clang-diagnostic-unused-comparison,
   clang-diagnostic-comma,
   clang-diagnostic-switch,
-  clang-diagnostic-switch-default
+  clang-diagnostic-switch-default,
+  clang-diagnostic-deprecated-non-prototype
 WarningsAsErrors: '*'
 HeaderFilterRegex: 'littlessh/'
 ExtraArgs:
@@ -56,13 +60,14 @@ ExtraArgs:
   - -Wcomma
   - -Wswitch
   - -Wswitch-default
+  - -Wdeprecated-non-prototype
 CheckOptions:
   readability-function-size.LineThreshold: 60
   readability-function-size.StatementThreshold: 60
   # Regexes against the qualified name: clang-tidy 19 accepts them here
   # (proved by tools/lint.sh --selftest). Setting this replaces the default
-  # libc list, which cert-err33-c covers instead. Keep the POSIX names in step
-  # with LIBC_MUST_CHECK in tools/lint.sh.
+  # libc list, which cert-err33-c covers instead. The POSIX names here are a
+  # second net: the shim (tools/lint.sh make_shim) covers every libc call.
   bugprone-unused-return-value.CheckedFunctions: >-
-    ^::psa_.*;^::rd_.*;^::send$;^::recv$;^::setsockopt$;^::getsockopt$;^::close$;^::shutdown$;^::select$;^::accept$;^::bind$;^::listen$;^::socket$;^::fcntl$;^::clock_gettime$;^::vsnprintf$;^::snprintf$
+    ^::psa_.*;^::rd_.*;^::send$;^::recv$;^::setsockopt$;^::getsockopt$;^::close$;^::shutdown$;^::select$;^::accept$;^::bind$;^::listen$;^::socket$;^::fcntl$;^::clock_gettime$;^::vsnprintf$;^::snprintf$;^::connect$;^::read$;^::write$;^::poll$;^::sendto$;^::recvfrom$;^::sendmsg$;^::recvmsg$;^::ioctl$;^::getaddrinfo$;^::getsockname$;^::getpeername$
   bugprone-unused-return-value.AllowCastToVoid: true
