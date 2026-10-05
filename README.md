@@ -61,6 +61,32 @@ cd test/host && make
 
 `bash tools/lint.sh` is the Power-of-10 gate for every `.c`/`.h` under littlessh/, run in a host and an `ESP_PLATFORM` configuration: cppcheck, clang-tidy (`.clang-tidy`: functions <= 60 lines and 60 statements, no recursion, every switch has a default, every result of a `LSSH_MUST_CHECK`/`psa_*`/`rd_*`/listed POSIX call used or cast to `(void)`, no comma operator) and `tools/p10_check.py` (no goto/setjmp after preprocessing, `LSSH_MUST_CHECK` on every non-void function, `LSSH_ASSERT` in every function and >= 2 per function on average, no constant asserts, no `#if 0`, no block macros, no calls in `?:` arms, no NOLINT/cppcheck-suppress/diagnostic pragmas). The header of `tools/lint.sh` maps each rule to its mechanism and lists the known limits. `bash tools/lint.sh --selftest` runs the real gate on a clean fixture (`tools/lint-fixture/`, must pass) and on one injected violation or negative control per rule, and fails unless each violation is reported at the injected line and each control passes.
 
+## coding rules
+
+littlessh/ follows Holzmann's Power of 10. `tools/lint.sh` checks what a tool can; the rest is review.
+
+| # | rule | littlessh | enforced by |
+|---|------|-----------|-------------|
+| 1 | no goto, setjmp/longjmp, recursion | yes | p10-goto (source and preprocessed), misc-no-recursion |
+| 2 | fixed loop bounds | yes, but for two event loops (below) | review; each bound is a buffer size or a named `LSSH_*` constant |
+| 3 | no heap after init | yes: one `calloc` in `lssh_server_run()`, before the first `accept()` | review |
+| 4 | functions <= 60 lines | yes | readability-function-size (60 lines, 60 statements), p10-function-lines |
+| 5 | >= 2 asserts per function | yes: at least one in every function, 2.47 on average | p10-assert-missing, -density, -constant |
+| 6 | smallest data scope | yes: file scope holds only const tables and the log tag | review |
+| 7 | check every result, validate arguments | yes | `LSSH_MUST_CHECK` + clang-diagnostic-unused-result, bugprone-unused-return-value, cert-err33-c |
+| 8 | limited preprocessor | yes, but for variadics (below) | p10-macro-braces, p10-config-probe, p10-if-constant, p10-macro-comma |
+| 9 | one dereference level, no function pointers | no (below) | none |
+| 10 | zero warnings, analysers on every change | analysers yes; compiler warnings (`-Wall -Wextra`) are not gated | cppcheck + clang-tidy, any diagnostic fails |
+
+`LSSH_ASSERT` guards internal invariants and app misuse of the API only. anything the peer controls stays a disconnect: on ESP-IDF a failed assert reboots the board.
+
+exceptions:
+- rule 9: the API is callbacks, i.e. function pointers in `lssh_config_t`; their results are not checked by the gate either.
+- rule 8: `lssh_printf` uses stdarg, and the `LOGI`/`LOGW` macros are variadic.
+- rule 2: the accept loop (`lssh_server_run`) and the per-connection loop (`serve_connection`) are event loops, bounded by `cfg->stop`, the auth deadline and the idle timeout rather than a count.
+- glotui/ and examples/ are not under the gate: glotui allocates on terminal resize, the BBS reallocs its fire buffer.
+- the gate has known limits (constructs it cannot see, holes left open from review); the header of `tools/lint.sh` lists them.
+
 ## why
 
 bring remote console to microcontrollers without the overhead of OpenSSH or dropbear. justifiable in homelabs, field setups, and scenarios where the alternate (serial console over RF) requires human intervention. based on PSA Crypto for compatibility across ESP-IDF versions (mbedTLS 2.28/3.x/4.x).
