@@ -71,6 +71,7 @@ static const char *TAG = "littlessh";
 #define SSH_MSG_CHANNEL_REQUEST          98
 #define SSH_MSG_CHANNEL_SUCCESS          99
 #define SSH_MSG_CHANNEL_FAILURE        100
+#define SSH_MSG_CONNECTION_LAST        127   /* 80..127: connection protocol */
 
 #define SSH_DISCONNECT_PROTOCOL_ERROR              2
 #define SSH_DISCONNECT_KEY_EXCHANGE_FAILED         3
@@ -140,6 +141,7 @@ struct lssh_session {
     uint8_t hostkey_pub[65];        /* 0x04 || X || Y */
 
     /* auth */
+    bool svc_userauth;              /* SERVICE_REQUEST("ssh-userauth") accepted */
     bool authed;
     char username[64];
     uint32_t auth_tries;
@@ -649,6 +651,17 @@ static LSSH_MUST_CHECK int kex_send_init(lssh_session_t *s){
     return 0;
 }
 
+/* A packet in a KEX wait. Non-strict: 1 skip it (IGNORE, DEBUG,
+ * UNIMPLEMENTED), -1 the client sent DISCONNECT (end quietly, no reply),
+ * 0 anything else. Strict KEX skips nothing: always 0. */
+static LSSH_MUST_CHECK int kex_skip(lssh_session_t *s, uint8_t t){
+    LSSH_ASSERT(s != NULL);
+    LSSH_ASSERT(!s->dead);   /* recv_packet just succeeded */
+    if (s->strict_kex) return 0;
+    if (t == SSH_MSG_DISCONNECT){ s->dead = true; return -1; }
+    return t == SSH_MSG_IGNORE || t == SSH_MSG_DEBUG || t == SSH_MSG_UNIMPLEMENTED;
+}
+
 /* client KEXINIT (already consumed by the caller on the rekey path) */
 static LSSH_MUST_CHECK int kex_recv_init(lssh_session_t *s){
     LSSH_ASSERT(s != NULL);
@@ -656,7 +669,10 @@ static LSSH_MUST_CHECK int kex_recv_init(lssh_session_t *s){
     for (unsigned skip = 0; !k->ck && skip <= LSSH_KEX_MAX_SKIP; skip++){
         const uint8_t *pl; size_t pn;
         if (recv_packet(s, &pl, &pn)) return -1;
-        if (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG){ k->skipped = true; continue; }
+        /* strict_kex is still unset: a strict client is refused below */
+        int sk = kex_skip(s, pl[0]);
+        if (sk < 0) return -1;
+        if (sk){ k->skipped = true; continue; }
         if (pl[0] != SSH_MSG_KEXINIT){
             send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "expected KEXINIT");
             return -1;
@@ -734,8 +750,9 @@ static LSSH_MUST_CHECK int kex_recv_ecdh_init(lssh_session_t *s){
     if (k->guess_follows && !k->guess_ok && recv_packet(s, &pl, &pn)) return -1;
     for (unsigned skip = 0; skip <= LSSH_KEX_MAX_SKIP; skip++){
         if (recv_packet(s, &pl, &pn)) return -1;
-        if (!s->strict_kex &&
-            (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG)) continue;
+        int sk = kex_skip(s, pl[0]);
+        if (sk < 0) return -1;
+        if (sk) continue;
         if (pl[0] != SSH_MSG_KEX_ECDH_INIT){
             send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "expected ECDH_INIT");
             return -1;
@@ -842,8 +859,9 @@ static LSSH_MUST_CHECK int kex_newkeys(lssh_session_t *s){
     for (unsigned skip = 0; skip <= LSSH_KEX_MAX_SKIP; skip++){
         const uint8_t *pl; size_t pn;
         if (recv_packet(s, &pl, &pn)) return -1;
-        if (!s->strict_kex &&
-            (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG)) continue;
+        int sk = kex_skip(s, pl[0]);
+        if (sk < 0) return -1;
+        if (sk) continue;
         if (pl[0] != SSH_MSG_NEWKEYS){
             send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "expected NEWKEYS");
             return -1;
@@ -992,13 +1010,13 @@ static LSSH_MUST_CHECK int auth_password(lssh_session_t *s, rdr_t *r, const char
     LSSH_ASSERT(user != NULL && ok != NULL);
     LSSH_ASSERT(s->cfg->password_auth != NULL);   /* handle_userauth checked */
     bool change; char pass[128];
-    if (!rd_bool(r,&change) || change ||
-        !rd_cstring(r, pass, sizeof pass)){
+    if (!rd_bool(r,&change) || !rd_cstring(r, pass, sizeof pass)){
         wipe(pass, sizeof pass);
         send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "bad password msg");
         return -1;
     }
-    *ok = s->cfg->password_auth(s->cfg->user, user, pass);
+    /* RFC 4252 §8: we change no passwords; a change request is a failed attempt */
+    *ok = !change && s->cfg->password_auth(s->cfg->user, user, pass);
     wipe(pass, sizeof pass);
     return 0;
 }
@@ -1093,10 +1111,7 @@ static LSSH_MUST_CHECK int auth_finish(lssh_session_t *s, bool ok, bool counted,
 static LSSH_MUST_CHECK int handle_userauth(lssh_session_t *s, const uint8_t *pl, size_t pn){
     LSSH_ASSERT(s != NULL && s->cfg != NULL);
     LSSH_ASSERT(pl != NULL);
-    if (s->authed){ /* RFC 4252: may ignore; reply success for idempotence */
-        uint8_t ok = SSH_MSG_USERAUTH_SUCCESS;
-        return send_packet(s, &ok, 1);
-    }
+    LSSH_ASSERT(!s->authed && s->svc_userauth);   /* process_transport checked */
     LSSH_ASSERT(pn >= 1);
     rdr_t r; rd_init(&r, pl, pn);
     uint8_t m;
@@ -1205,6 +1220,35 @@ static LSSH_MUST_CHECK int ch_reply(lssh_session_t *s, bool want_reply, bool ok)
                           s->ch_remote_id);
 }
 
+/* a terminal dimension from the wire, saturated to on_pty's uint16_t */
+static LSSH_MUST_CHECK uint16_t clamp_u16(uint32_t v){
+    uint16_t c = v > 0xFFFFu ? (uint16_t)0xFFFFu : (uint16_t)v;
+    LSSH_ASSERT(c <= v);
+    LSSH_ASSERT(c == v || c == 0xFFFFu);
+    return c;
+}
+
+/* pty-req (pty) or window-change: TERM (pty-req only), cols, rows, pixel
+ * size, modes (pty-req only). Queues on_pty with the size; false if the
+ * request is malformed, leaving the session as it was. */
+static LSSH_MUST_CHECK bool ch_req_size(lssh_session_t *s, rdr_t *r, bool pty){
+    LSSH_ASSERT(s != NULL && r != NULL);
+    LSSH_ASSERT(s->ch_open);   /* handle_channel_request checked */
+    char term[32] = ""; uint32_t cols, rows, px, py;
+    const uint8_t *modes; uint32_t modes_len;
+    if (pty && !rd_cstring(r, term, sizeof term)) return false;
+    if (!rd_u32(r,&cols) || !rd_u32(r,&rows) || !rd_u32(r,&px) || !rd_u32(r,&py) ||
+        (pty && !rd_string(r,&modes,&modes_len))) return false;
+    if (pty){
+        s->has_pty = true;
+        memcpy(s->term, term, strlen(term) + 1);
+    }
+    /* callbacks are queued (pend_*) and run by dispatch_events() */
+    s->pend_pty = true;
+    s->pend_cols = clamp_u16(cols); s->pend_rows = clamp_u16(rows);
+    return true;
+}
+
 static LSSH_MUST_CHECK int handle_channel_request(lssh_session_t *s, const uint8_t *pl,
                                                   size_t pn){
     LSSH_ASSERT(s->authed);
@@ -1214,28 +1258,10 @@ static LSSH_MUST_CHECK int handle_channel_request(lssh_session_t *s, const uint8
         !rd_bool(&r,&want_reply) || !s->ch_open){
         return 0; /* tolerate */
     }
-    /* callbacks are queued (pend_*) and run by dispatch_events() */
-    if (strcmp(req, "pty-req") == 0){
-        char term[32]; uint32_t cols=80, rows=24, px, py;
-        const uint8_t *modes; uint32_t modes_len;
-        if (rd_cstring(&r, term, sizeof term) &&
-            rd_u32(&r,&cols) && rd_u32(&r,&rows) &&
-            rd_u32(&r,&px) && rd_u32(&r,&py) &&
-            rd_string(&r,&modes,&modes_len)){
-            s->has_pty = true;
-            memcpy(s->term, term, strlen(term) + 1);
-            s->pend_pty = true;
-            s->pend_cols = (uint16_t)cols; s->pend_rows = (uint16_t)rows;
-            return ch_reply(s, want_reply, true);
-        }
-        return ch_reply(s, want_reply, false);
-    }
+    if (strcmp(req, "pty-req") == 0)
+        return ch_reply(s, want_reply, ch_req_size(s, &r, true));
     if (strcmp(req, "window-change") == 0){
-        uint32_t cols, rows, px, py;
-        if (rd_u32(&r,&cols) && rd_u32(&r,&rows) && rd_u32(&r,&px) && rd_u32(&r,&py)){
-            s->pend_pty = true;
-            s->pend_cols = (uint16_t)cols; s->pend_rows = (uint16_t)rows;
-        }
+        (void)!ch_req_size(s, &r, false);   /* RFC 4254 §6.7: never replied to */
         return 0;
     }
     if (strcmp(req, "shell") == 0 || strcmp(req, "exec") == 0){
@@ -1250,9 +1276,9 @@ static LSSH_MUST_CHECK int handle_channel_request(lssh_session_t *s, const uint8
         s->pend_exec = exec;
         return 0;
     }
-    if (strcmp(req, "env") == 0 || strcmp(req, "signal") == 0)
+    if (strcmp(req, "signal") == 0)
         return ch_reply(s, want_reply, true);
-    /* subsystem (sftp), x11, auth-agent, etc. */
+    /* env (we set no environment), subsystem (sftp), x11, auth-agent, etc. */
     return ch_reply(s, want_reply, false);
 }
 
@@ -1273,6 +1299,7 @@ static LSSH_MUST_CHECK int handle_service_request(lssh_session_t *s, const uint8
     wr_u8(&w, SSH_MSG_SERVICE_ACCEPT);
     wr_cstr(&w, "ssh-userauth");
     if (w.err || send_packet(s, buf, w.len)) return -1;
+    s->svc_userauth = true;
     if (s->cfg->banner){
         /* chdata is free until a channel exists */
         wtr_t bw; wr_init(&bw, s->chdata, LSSH_MAX_PACKET - 32);
@@ -1324,6 +1351,11 @@ static LSSH_MUST_CHECK int process_transport(lssh_session_t *s, const uint8_t *p
         return handle_service_request(s, pl, pn);
 
     case SSH_MSG_USERAUTH_REQUEST:
+        if (s->authed) return 0;   /* RFC 4252 §5.1: ignored silently */
+        if (!s->svc_userauth){
+            send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "ssh-userauth not requested");
+            return -1;
+        }
         return handle_userauth(s, pl, pn);
 
     case SSH_MSG_GLOBAL_REQUEST:
@@ -1455,13 +1487,14 @@ static LSSH_MUST_CHECK int process_packet(lssh_session_t *s){
     int rc = process_transport(s, pl, pn);
     if (rc <= 0) return rc;
 
-    if (!s->authed){
+    if (s->authed){
+        rc = process_channel(s, pl, pn);
+        if (rc <= 0) return rc;
+    } else if (pl[0] >= SSH_MSG_GLOBAL_REQUEST && pl[0] <= SSH_MSG_CONNECTION_LAST){
         send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "not authenticated");
         return -1;
     }
-
-    rc = process_channel(s, pl, pn);
-    if (rc <= 0) return rc;
+    /* RFC 4253 §11.4, before auth too */
     return send_unimplemented(s);
 }
 

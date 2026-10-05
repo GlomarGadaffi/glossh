@@ -102,7 +102,9 @@ typedef struct lssh_config {
     /* Keystrokes / stdin from the client. `data` stays valid and unchanged
      * for the whole call, including across lssh_write(). */
     void (*on_data)(void *user, lssh_session_t *s, const uint8_t *data, size_t len);
-    /* pty-req and window-change. May be NULL. */
+    /* pty-req and window-change. May be NULL. Sizes above 65535 arrive as
+     * 65535; either may be 0 (RFC 4254: use the pixel size instead), so
+     * treat 0 as "unknown" rather than dividing by it. */
     void (*on_pty)(void *user, lssh_session_t *s, uint16_t cols, uint16_t rows);
     /* Channel torn down (client close, EOF+close, or transport loss). */
     void (*on_close)(void *user, lssh_session_t *s);

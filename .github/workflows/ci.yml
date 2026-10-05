@@ -13,7 +13,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y build-essential libmbedtls-dev openssh-client sshpass \
-            python3 procps util-linux cppcheck clang-tidy git gcc-multilib
+            python3 python3-cryptography procps util-linux cppcheck clang-tidy git gcc-multilib
       - uses: actions/checkout@v4
       - name: host tests
         run: |

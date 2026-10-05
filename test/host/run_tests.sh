@@ -107,6 +107,24 @@ out=$(timeout 10 python3 rawssh.py strict-ignore $PORT 2>&1)
 [ $? -eq 0 ] && ok "strict KEX: IGNORE before KEXINIT is rejected ($out)" \
   || bad "strict KEX: IGNORE before KEXINIT is rejected ($out)"
 
+# 14-21. rawssh.py probes: what an OpenSSH client never sends (see each
+#        probe's docstring). pty-clamp is checked in the harness's on_pty log.
+probe(){
+  out=$(timeout 10 python3 rawssh.py $1 $PORT 2>&1)
+  [ $? -eq 0 ] && ok "$2 ($out)" || bad "$2 ($out)"
+}
+probe kex-disconnect "client DISCONNECT in a KEX wait ends it quietly"
+probe kex-unimplemented "UNIMPLEMENTED skipped in non-strict KEX waits"
+probe unimplemented "unknown message before auth gets UNIMPLEMENTED"
+probe auth-twice "USERAUTH_REQUEST after SUCCESS is ignored"
+probe password-change "password change request fails and counts"
+probe auth-no-service "USERAUTH_REQUEST before SERVICE_REQUEST is rejected"
+probe env "env channel request fails"
+probe pty-clamp "pty-req / window-change sent"
+grep -q "harness: pty 65535x24" server.log && grep -q "harness: pty 80x65535" server.log \
+  && ok "pty sizes clamp to 65535" \
+  || bad "pty sizes clamp to 65535 ($(grep 'harness: pty' server.log | tail -2 | tr '\n' ' '))"
+
 kill -0 $SRV 2>/dev/null && ok "server survived every client" || bad "server died (see server.log)"
 kill $SRV 2>/dev/null
 pkill -f './harness' 2>/dev/null
