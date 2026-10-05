@@ -96,6 +96,17 @@ kill $EPH 2>/dev/null
 [ -n "$k1" ] && [ "$k1" = "$k2" ] && ok "ephemeral host key stable across connections" \
   || bad "ephemeral host key changed between connections"
 
+# 12. a flood of IGNOREs before KEXINIT is cut off (LSSH_KEX_MAX_SKIP) with a
+#     protocol error, instead of holding the slot to the auth deadline (2 s)
+out=$(timeout 10 python3 rawssh.py ignore-flood $PORT 2>&1)
+[ $? -eq 0 ] && ok "IGNORE flood before KEXINIT is cut off ($out)" \
+  || bad "IGNORE flood before KEXINIT is cut off ($out)"
+
+# 13. strict KEX: a client offering kex-strict-c-v00 must send KEXINIT first
+out=$(timeout 10 python3 rawssh.py strict-ignore $PORT 2>&1)
+[ $? -eq 0 ] && ok "strict KEX: IGNORE before KEXINIT is rejected ($out)" \
+  || bad "strict KEX: IGNORE before KEXINIT is rejected ($out)"
+
 kill -0 $SRV 2>/dev/null && ok "server survived every client" || bad "server died (see server.log)"
 kill $SRV 2>/dev/null
 pkill -f './harness' 2>/dev/null

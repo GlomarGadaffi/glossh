@@ -185,6 +185,20 @@ struct lssh_session {
  * packets that arrive if that callback's writes pump the connection. */
 #define LSSH_RX_CHUNK  (LSSH_MAX_PACKET / 2)
 
+/* Loop bounds (Power of 10 rule 2) */
+#ifndef LSSH_KEX_MAX_SKIP
+#define LSSH_KEX_MAX_SKIP    32   /* IGNORE/DEBUG skipped per KEX wait */
+#endif
+#ifndef LSSH_IO_MAX_RETRY
+#define LSSH_IO_MAX_RETRY    64   /* socket waits in a row that move no bytes */
+#endif
+#ifndef LSSH_WRITE_MAX_PUMPS
+#define LSSH_WRITE_MAX_PUMPS 256  /* packets pumped in a row without window */
+#endif
+#ifndef LSSH_DISPATCH_MAX
+#define LSSH_DISPATCH_MAX    16   /* app callbacks per dispatch_events() */
+#endif
+
 static LSSH_MUST_CHECK uint64_t mono_ms(void);
 static LSSH_MUST_CHECK int wait_readable(int fd, uint32_t ms);
 
@@ -244,6 +258,7 @@ static void wr_mpint(wtr_t *w, const uint8_t *d, size_t n){
 static LSSH_MUST_CHECK bool namelist_has(const uint8_t *list, uint32_t len, const char *name){
     size_t nl = strlen(name);
     uint32_t i = 0;
+    /* i grows every pass; len is an in-packet length, so i = j+1 cannot wrap */
     while (i < len){
         uint32_t j = i;
         while (j < len && list[j] != ',') j++;
@@ -257,7 +272,9 @@ static LSSH_MUST_CHECK bool namelist_has(const uint8_t *list, uint32_t len, cons
 
 static LSSH_MUST_CHECK int io_recv_exact(lssh_session_t *s, uint8_t *buf, size_t n){
     size_t got = 0;
+    unsigned stall = 0;   /* passes in a row that read nothing */
     while (got < n){
+        if (stall++ >= LSSH_IO_MAX_RETRY) return -1;
         /* until auth succeeds the whole login shares one wall-clock budget,
          * so a silent or trickling client cannot hold the only slot */
         if (!s->authed && s->auth_deadline){
@@ -274,19 +291,23 @@ static LSSH_MUST_CHECK int io_recv_exact(lssh_session_t *s, uint8_t *buf, size_t
             return -1;
         }
         got += (size_t)r;
+        stall = 0;
     }
     return 0;
 }
 
 static LSSH_MUST_CHECK int io_send_all(lssh_session_t *s, const uint8_t *buf, size_t n){
     size_t sent = 0;
+    unsigned stall = 0;   /* passes in a row that sent nothing */
     while (sent < n){
+        if (stall++ >= LSSH_IO_MAX_RETRY) return -1;
         /* a peer that already hung up must not SIGPIPE the whole server */
         ssize_t r = send(s->fd, buf+sent, n-sent, MSG_NOSIGNAL);
         if (r < 0){
             if (errno == EINTR) continue;
             return -1;
         }
+        if (r > 0) stall = 0;
         sent += (size_t)r;
     }
     return 0;
@@ -495,7 +516,7 @@ static LSSH_MUST_CHECK int kdf_blocks(const uint8_t *kmp, size_t kmplen, const u
                                       uint8_t *acc, size_t need){
     LSSH_ASSERT(kmp != NULL && acc != NULL);
     size_t have = 0;
-    while (have < need){
+    while (have < need){   /* at most KDF_ACC / 32 passes: checked below */
         hsh_t h = { PSA_HASH_OPERATION_INIT, false };
         if (psa_hash_setup(&h.op, PSA_ALG_SHA_256) != PSA_SUCCESS) return -1;
         hs_update(&h, kmp, kmplen);
@@ -548,7 +569,7 @@ static LSSH_MUST_CHECK int kex_send_init(lssh_session_t *s){
 static LSSH_MUST_CHECK int kex_recv_init(lssh_session_t *s){
     LSSH_ASSERT(s != NULL);
     kex_ctx_t *k = &s->kex;
-    while (!k->ck){
+    for (unsigned skip = 0; !k->ck && skip <= LSSH_KEX_MAX_SKIP; skip++){
         const uint8_t *pl; size_t pn;
         if (recv_packet(s, &pl, &pn)) return -1;
         if (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG){ k->skipped = true; continue; }
@@ -557,6 +578,10 @@ static LSSH_MUST_CHECK int kex_recv_init(lssh_session_t *s){
             return -1;
         }
         k->ck = pl; k->ckn = pn;
+    }
+    if (!k->ck){
+        send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "too many IGNORE/DEBUG in kex");
+        return -1;
     }
 
     if (check_client_kexinit(k->ck, k->ckn, &k->guess_follows, &k->client_strict,
@@ -617,11 +642,10 @@ static LSSH_MUST_CHECK int kex_ephemeral(lssh_session_t *s){
 static LSSH_MUST_CHECK int kex_recv_ecdh_init(lssh_session_t *s){
     LSSH_ASSERT(s != NULL);
     kex_ctx_t *k = &s->kex;
-    bool discard_one = k->guess_follows && !k->guess_ok;
-    for (;;){
-        const uint8_t *pl; size_t pn;
+    const uint8_t *pl; size_t pn;
+    if (k->guess_follows && !k->guess_ok && recv_packet(s, &pl, &pn)) return -1;
+    for (unsigned skip = 0; skip <= LSSH_KEX_MAX_SKIP; skip++){
         if (recv_packet(s, &pl, &pn)) return -1;
-        if (discard_one){ discard_one = false; continue; }
         if (!s->strict_kex &&
             (pl[0] == SSH_MSG_IGNORE || pl[0] == SSH_MSG_DEBUG)) continue;
         if (pl[0] != SSH_MSG_KEX_ECDH_INIT){
@@ -638,6 +662,8 @@ static LSSH_MUST_CHECK int kex_recv_ecdh_init(lssh_session_t *s){
         memcpy(k->q_c, qc, 32);
         return 0;
     }
+    send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "too many IGNORE/DEBUG in kex");
+    return -1;
 }
 
 /* X25519 shared secret, and K as mpint bytes (RFC 8731: output interpreted
@@ -720,7 +746,7 @@ static LSSH_MUST_CHECK int kex_newkeys(lssh_session_t *s){
     LSSH_ASSERT(s->have_sid);
     uint8_t nk = SSH_MSG_NEWKEYS;
     if (send_packet(s, &nk, 1)) return -1;
-    for (;;){
+    for (unsigned skip = 0; skip <= LSSH_KEX_MAX_SKIP; skip++){
         const uint8_t *pl; size_t pn;
         if (recv_packet(s, &pl, &pn)) return -1;
         if (!s->strict_kex &&
@@ -731,6 +757,8 @@ static LSSH_MUST_CHECK int kex_newkeys(lssh_session_t *s){
         }
         return 0;
     }
+    send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "too many IGNORE/DEBUG in kex");
+    return -1;
 }
 
 /* derive and install keys */
@@ -815,6 +843,7 @@ static LSSH_MUST_CHECK bool parse_user_sig(const uint8_t *sig, uint32_t sig_len,
     rdr_t rr; rd_init(&rr, rsblob, rsl);
     const uint8_t *rb, *sb; uint32_t rbl, sbl;
     if (!rd_string(&rr,&rb,&rbl) || !rd_string(&rr,&sb,&sbl)) return false;
+    /* bounded by the in-packet lengths rbl / sbl */
     while (rbl && rb[0]==0){ rb++; rbl--; }
     while (sbl && sb[0]==0){ sb++; sbl--; }
     if (rbl > 32 || sbl > 32) return false;
@@ -1014,6 +1043,10 @@ static LSSH_MUST_CHECK int handle_channel_open(lssh_session_t *s, const uint8_t 
         wr_cstr(&w, "");
         if (w.err) return -1;
         return send_packet(s, buf, w.len);
+    }
+    if (maxpkt == 0){   /* lssh_write could never send a byte */
+        send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "bad channel open");
+        return -1;
     }
     s->ch_open = true;
     s->ch_started = false;
@@ -1291,10 +1324,14 @@ static LSSH_MUST_CHECK int process_packet(lssh_session_t *s){
 /* Run queued app callbacks: pty, then open, then data, in arrival order
  * per kind. Only from the connection loop (write_depth == 0). Data is
  * delivered out of rxq; packets pumped by writes inside on_data append
- * behind the delivered bytes, so the callback's pointer stays valid. */
-static void dispatch_events(lssh_session_t *s){
+ * behind the delivered bytes, so the callback's pointer stays valid.
+ * At most LSSH_DISPATCH_MAX callbacks; true if it stopped there, so the
+ * caller comes back before blocking on the socket. */
+static LSSH_MUST_CHECK bool dispatch_events(lssh_session_t *s){
     const lssh_config_t *c = s->cfg;
-    while (!s->dead && s->ch_open && !s->ch_rcvd_close && s->write_depth == 0){
+    for (unsigned i = 0; i < LSSH_DISPATCH_MAX; i++){
+        if (s->dead || !s->ch_open || s->ch_rcvd_close || s->write_depth != 0)
+            return false;
         if (s->pend_pty){
             s->pend_pty = false;
             if (c->on_pty) c->on_pty(c->user, s, s->pend_cols, s->pend_rows);
@@ -1307,9 +1344,10 @@ static void dispatch_events(lssh_session_t *s){
             memmove(s->rxq, s->rxq + n, s->rxq_len - n);
             s->rxq_len -= n;
         } else {
-            break;
+            return false;
         }
     }
+    return true;
 }
 
 /* ------------------------------------------------------------ public API */
@@ -1323,19 +1361,23 @@ ssize_t lssh_write(lssh_session_t *s, const void *data, size_t len){
     if (!s->ch_open || s->ch_sent_close || s->ch_sent_eof || s->dead) return -1;
     const uint8_t *d = data;
     size_t left = len;
+    unsigned pumps = 0;   /* packets pumped since the window last grew */
+    /* each pass sends >= 1 byte (max_out > 0) or pumps a counted packet */
     while (left){
         if (s->win_out == 0){
             /* pump the connection until the client grants window. Pumped
              * packets only queue events (no callbacks run here), so depth
              * stays at 1. Stop, short, if rxq could not take another data
-             * packet: the client is typing while refusing our output. */
-            if (s->write_depth > 0 ||
+             * packet: the client is typing while refusing our output; or
+             * after LSSH_WRITE_MAX_PUMPS packets that granted nothing. */
+            if (s->write_depth > 0 || pumps >= LSSH_WRITE_MAX_PUMPS ||
                 sizeof s->rxq - s->rxq_len < LSSH_IN_MAXPKT)
                 return (ssize_t)(len - left);
             s->write_depth++;
             int rc = process_packet(s);
             s->write_depth--;
             if (rc) return -1;
+            pumps = s->win_out ? 0 : pumps + 1;
             continue;
         }
         size_t chunk = left;
@@ -1461,7 +1503,7 @@ static LSSH_MUST_CHECK int version_exchange(lssh_session_t *s){
     if (io_send_all(s, (const uint8_t*)ident, strlen(ident))) return -1;
     /* read the client identification line (byte-at-a-time; happens once) */
     size_t n = 0;
-    while (n < sizeof(s->v_c) - 1){
+    while (n < sizeof(s->v_c) - 1){   /* one byte per pass */
         uint8_t c;
         if (io_recv_exact(s, &c, 1)) return -1;
         if (c == '\n'){
@@ -1504,9 +1546,11 @@ static void serve_connection(lssh_session_t *s){
     if (do_kex(s, NULL, 0)) return;
     const lssh_config_t *c = s->cfg;
     uint64_t last_rx = mono_ms(), next_tick = 0;
+    /* event loop: bounded by the auth deadline, the idle timeout and the peer */
     while (!s->dead){
-        dispatch_events(s);
+        bool more = dispatch_events(s);
         if (s->dead || s->ch_rcvd_close) break;   /* close seen by a write's pump */
+        if (more) continue;                        /* the rest before blocking */
         /* With ticks on, wait for the next packet in select() so on_tick can
          * run in between; SO_RCVTIMEO never fires there, so enforce the idle
          * timeout here. A packet that has started arriving is still read
@@ -1611,6 +1655,7 @@ int lssh_server_run(const lssh_config_t *cfg){
     LOGI("listening (%s)", LSSH_IDENT);
 
     int rc = 0;
+    /* event loop: bounded by cfg->stop (runs for the server's lifetime) */
     while (!(cfg->stop && *cfg->stop)){
         int cfd = accept(lfd, NULL, NULL);
         if (cfd < 0){
