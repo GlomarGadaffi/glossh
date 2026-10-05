@@ -621,8 +621,11 @@ static LSSH_MUST_CHECK int kdf_blocks(const uint8_t *kmp, size_t kmplen, const u
         }
         size_t olen = 0;
         if (h.err || have + 32 > KDF_ACC) { (void)psa_hash_abort(&h.op); return -1; }
-        if (psa_hash_finish(&h.op, acc + have, 32, &olen) != PSA_SUCCESS || olen != 32)
+        /* PSA: a failed finish leaves the operation to abort */
+        if (psa_hash_finish(&h.op, acc + have, 32, &olen) != PSA_SUCCESS || olen != 32){
+            (void)psa_hash_abort(&h.op);
             return -1;
+        }
         have += 32;
     }
     return 0;
@@ -821,7 +824,12 @@ static LSSH_MUST_CHECK int kex_finish_hash(lssh_session_t *s){
     if (k->hop.err) return -1;                 /* still live: kex_ctx_wipe aborts it */
     size_t olen = 0;
     k->hop_live = false;
-    if (psa_hash_finish(&k->hop.op, k->H, 32, &olen) != PSA_SUCCESS || olen != 32) return -1;
+    /* PSA: a failed finish leaves the operation to abort (hop_live is
+     * already clear, so kex_ctx_wipe would not) */
+    if (psa_hash_finish(&k->hop.op, k->H, 32, &olen) != PSA_SUCCESS || olen != 32){
+        (void)psa_hash_abort(&k->hop.op);
+        return -1;
+    }
     if (!s->have_sid){ memcpy(s->session_id, k->H, 32); s->have_sid = true; }
     LSSH_ASSERT(s->have_sid && !k->hop_live);
     return 0;
@@ -1859,6 +1867,10 @@ static void serve_client(lssh_session_t *s, const lssh_config_t *cfg, int cfd,
     LSSH_ASSERT(!s->ch_open && s->write_depth == 0);   /* torn down, unwound */
     if (s->k_in) (void)psa_destroy_key(s->k_in);
     if (s->k_out) (void)psa_destroy_key(s->k_out);
+    /* nothing of this connection outlives it: the last password stays in
+     * payload, the IVs and session id in the struct, until wiped here */
+    wipe(s, sizeof *s);
+    LSSH_ASSERT(s->cfg == NULL && !s->authed);
     (void)close(cfd);
     LOGI("connection closed");
 }

@@ -82,6 +82,7 @@ littlessh/ follows Holzmann's Power of 10. `tools/lint.sh` checks what a tool ca
 
 exceptions:
 - rule 9: the API is callbacks, i.e. function pointers in `lssh_config_t`; their results are not checked by the gate either.
+- rule 3 holds for littlessh's own code, not inside PSA: on ESP-IDF 6 every SHA-256 `psa_hash_setup` allocates (`heap_caps_malloc` in the hardware SHA driver), so each key exchange and publickey login touches the heap there.
 - rule 8: `lssh_printf` uses stdarg, and the `LOGI`/`LOGW` macros are variadic.
 - rule 2: the accept loop (`lssh_server_run`) and the per-connection loop (`serve_connection`) are event loops, bounded by `cfg->stop`, the auth deadline and the idle timeout rather than a count.
 - glotui/ and examples/ are not under the gate: glotui allocates on terminal resize, the BBS reallocs its fire buffer.
