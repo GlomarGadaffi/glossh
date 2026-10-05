@@ -43,7 +43,7 @@ transport parameters:
 
 ## examples
 
-both examples log in as `admin` / `changeme` � demo credentials, change them before the board goes on a network you don't own. the host key is generated once and kept in NVS, so pin it on first connect rather than disabling host key checking.
+both examples log in as `admin` / `changeme` — demo credentials, change them before the board goes on a network you don't own. the host key is generated once and kept in NVS, so pin it on first connect rather than disabling host key checking.
 
 - `examples/esp32_shell` — line-oriented config shell over W5500 Ethernet (LilyGO T-ETH-ELITE S3).
 - `examples/esp32_bbs` — **GLOSSH BBS**: an ANSI-art bulletin board in the IIgs palette on the same board. terminal check, dial-up with modem LEDs, C-Net-style block logo with GeoCities hit counter, KEEP-style main menu with an animated radio tower, bulletins, last callers, live system status (heap, CPU history), a Telix-style FreeRTOS task monitor, a persistent guestbook (NVS), fire/plasma/greetz art gallery, page-the-sysop, NO CARRIER. `ssh -t admin@<board-ip>` (password `changeme`). needs 80x24; uses up to 132x50.
