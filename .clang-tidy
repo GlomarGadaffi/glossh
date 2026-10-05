@@ -1,17 +1,35 @@
 # Power-of-10 gate for littlessh (run via tools/lint.sh; checked with clang-tidy 19).
+# tools/lint.sh's header is the full rule -> mechanism map and lists the known
+# limits; this file holds the clang-tidy half.
 #
-# Rule map:
-#   1  no goto        cppcoreguidelines-avoid-goto is enabled, but clang-tidy 19
-#                     does not report C gotos (verified empirically), so the
-#                     real gate is the grep in tools/lint.sh.
-#   4  <= 60 lines    readability-function-size, LineThreshold 60.
-#   5  asserts        tools/assert_density.py (not clang-tidy).
-#   7  check returns  bugprone-unused-return-value for every psa_* call and
-#                     every rd_* reader; an explicit (void) cast is the only
-#                     accepted way to drop one. cert-err33-c covers libc.
-#   -  switch default bugprone-switch-missing-default-case (part of bugprone-*).
-#                     It fires only on non-enum selectors; enum switches are
-#                     covered by the compiler's -Wswitch.
+#   1  recursion      misc-no-recursion (direct and mutual, per translation unit).
+#                     goto is not here: clang-tidy 19 does not report C gotos
+#                     (cppcoreguidelines-avoid-goto is C++-only in practice), so
+#                     tools/p10_check.py checks the source and the preprocessed text.
+#   4  function size  readability-function-size: 60 lines and 60 statements
+#                     (clang counts nested statements; the statement limit stops
+#                     the line limit being met by packing statements onto lines).
+#   7  check returns  clang-diagnostic-unused-result: every littlessh function
+#                     with a non-void return is LSSH_MUST_CHECK, and lint.sh
+#                     force-includes a shim giving the psa_* calls littlessh makes
+#                     (and the libc calls below) warn_unused_result.
+#                     bugprone-unused-return-value for ^::psa_.*, ^::rd_.* and the
+#                     POSIX calls littlessh makes; cert-err33-c for the rest of libc.
+#                     An explicit (void) cast is the only accepted way to drop one.
+#                     clang-diagnostic-unused-value / -unused-comparison: results
+#                     computed and thrown away; clang-diagnostic-comma (-Wcomma):
+#                     comma operator outside for headers (left operand cast to void
+#                     excepted).
+#                     CheckedReturnTypes '^::psa_status_t$' was tried and dropped:
+#                     clang-tidy 19 accepts it but matches the canonical type
+#                     (int), so it never fires.
+#   -  switch default bugprone-switch-missing-default-case (non-enum selectors),
+#                     clang-diagnostic-switch-default (-Wswitch-default, every
+#                     switch, enum selectors too) and clang-diagnostic-switch.
+#
+# Every enabled check is an error. HeaderFilterRegex 'littlessh/' reports
+# findings in any header under littlessh/ (and under the selftest fixture's
+# littlessh/ copy); system and mbedTLS headers stay silent.
 #
 # Exclusions:
 #   bugprone-easily-swappable-parameters: flags nearly every (ptr, len) pair
@@ -21,14 +39,30 @@ Checks: >-
   bugprone-*,
   -bugprone-easily-swappable-parameters,
   cert-err33-c,
-  cppcoreguidelines-avoid-goto,
-  readability-function-size
+  misc-no-recursion,
+  readability-function-size,
+  clang-diagnostic-unused-result,
+  clang-diagnostic-unused-value,
+  clang-diagnostic-unused-comparison,
+  clang-diagnostic-comma,
+  clang-diagnostic-switch,
+  clang-diagnostic-switch-default
 WarningsAsErrors: '*'
-HeaderFilterRegex: 'littlessh/include/'
+HeaderFilterRegex: 'littlessh/'
+ExtraArgs:
+  - -Wunused-result
+  - -Wunused-value
+  - -Wunused-comparison
+  - -Wcomma
+  - -Wswitch
+  - -Wswitch-default
 CheckOptions:
   readability-function-size.LineThreshold: 60
+  readability-function-size.StatementThreshold: 60
   # Regexes against the qualified name: clang-tidy 19 accepts them here
   # (proved by tools/lint.sh --selftest). Setting this replaces the default
-  # libc list, which cert-err33-c covers instead.
-  bugprone-unused-return-value.CheckedFunctions: '^::psa_.*;^::rd_.*'
+  # libc list, which cert-err33-c covers instead. Keep the POSIX names in step
+  # with LIBC_MUST_CHECK in tools/lint.sh.
+  bugprone-unused-return-value.CheckedFunctions: >-
+    ^::psa_.*;^::rd_.*;^::send$;^::recv$;^::setsockopt$;^::getsockopt$;^::close$;^::shutdown$;^::select$;^::accept$;^::bind$;^::listen$;^::socket$;^::fcntl$;^::clock_gettime$;^::vsnprintf$;^::snprintf$
   bugprone-unused-return-value.AllowCastToVoid: true
