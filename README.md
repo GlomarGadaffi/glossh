@@ -57,7 +57,7 @@ cd test/host && make
 
 ## tests
 
-`test/host`: `bash run_tests.sh` (littlessh vs OpenSSH: auth, pty, >4 KB lines, writes that outrun the window, client rekey, pre-auth deadline, ephemeral key stability), `./glotui_test` (renderer, CP437, keys), `bash bbs_smoke.sh` (BBS end to end vs OpenSSH, incl. idle timeout under ticks). needs libmbedtls-dev, openssh-client, sshpass.
+`test/host`: `bash run_tests.sh` (littlessh vs OpenSSH: auth, pty, >4 KB lines, writes that outrun the window, client rekey, pre-auth deadline, ephemeral key stability), `./glotui_test` (renderer, CP437, keys), `./wire32_test` (wire bounds with peer-sized lengths; also `make wire32_test_m32` for a 32-bit `size_t`, where `off + n` can wrap), `bash bbs_smoke.sh` (BBS end to end vs OpenSSH, incl. idle timeout under ticks). needs libmbedtls-dev, openssh-client, sshpass.
 
 ## why
 

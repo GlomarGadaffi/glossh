@@ -183,7 +183,7 @@ static bool rd_u32(rdr_t *r, uint32_t *v){
 }
 static bool rd_string(rdr_t *r, const uint8_t **s, uint32_t *slen){
     uint32_t n; if(!rd_u32(r,&n)) return false;
-    if (r->off+n>r->len) return false;
+    if (n > r->len - r->off) return false;   /* off <= len; off+n can wrap a 32-bit size_t */
     *s=r->p+r->off; *slen=n; r->off+=n; return true;
 }
 /* copy a string into a NUL-terminated buffer; rejects embedded NULs */
@@ -195,7 +195,7 @@ static bool rd_cstring(rdr_t *r, char *out, size_t cap){
 
 static void wr_init(wtr_t *w, uint8_t *p, size_t cap){ w->p=p; w->cap=cap; w->len=0; w->err=false; }
 static void wr_raw(wtr_t *w, const void *d, size_t n){
-    if (w->err || w->len+n>w->cap){ w->err=true; return; }
+    if (w->err || n > w->cap - w->len){ w->err=true; return; }   /* len <= cap; no wrap */
     memcpy(w->p+w->len,d,n); w->len+=n;
 }
 static void wr_u8(wtr_t *w, uint8_t v){ wr_raw(w,&v,1); }

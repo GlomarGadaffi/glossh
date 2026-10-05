@@ -27,3 +27,5 @@ test/host/harness
 test/host/glotui_test
 test/host/bbs_host
 test/host/id_ecdsa*
+test/host/wire32_test
+test/host/wire32_test_m32
