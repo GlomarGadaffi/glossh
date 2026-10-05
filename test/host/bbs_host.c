@@ -18,7 +18,7 @@ int main(int argc, char **argv){
     static uint8_t hostkey[32];
     static char fp[64];
     if (lssh_hostkey_generate(hostkey)){ fprintf(stderr, "hostkey gen failed\n"); return 1; }
-    lssh_hostkey_fingerprint(hostkey, fp, sizeof fp);
+    (void)!lssh_hostkey_fingerprint(hostkey, fp, sizeof fp);
     fprintf(stderr, "bbs_host: port %u, host key %s, any user / password 'bbs'\n", port, fp);
 
     bbs_config_t bc = { .hostkey_fp = fp };

@@ -918,8 +918,8 @@ static void draw_bye(gt_t *t){
 static void hang_up(void){
     B.leaving = true;
     gt_end(B.t);
-    lssh_printf(B.s, "\r\n\x1b[0mNO CARRIER\r\n");
-    lssh_exit(B.s, 0);
+    (void)!lssh_printf(B.s, "\r\n\x1b[0mNO CARRIER\r\n");
+    (void)!lssh_exit(B.s, 0);
 }
 
 /* ---------------------------------------------------------- render */
@@ -1081,9 +1081,9 @@ void bbs_on_pty(void *user, lssh_session_t *s, uint16_t cols, uint16_t rows){
 void bbs_on_open(void *user, lssh_session_t *s, const char *exec_cmd){
     (void)user;
     if (exec_cmd || !lssh_has_pty(s)){
-        lssh_printf(s, "GLOSSH BBS is an interactive board. Call in with a terminal:\r\n"
-                       "  ssh -t <user>@<board>\r\n");
-        lssh_exit(s, exec_cmd ? 1 : 0);
+        (void)!lssh_printf(s, "GLOSSH BBS is an interactive board. Call in with a terminal:\r\n"
+                              "  ssh -t <user>@<board>\r\n");
+        (void)!lssh_exit(s, exec_cmd ? 1 : 0);
         return;
     }
     free(B.fire.heat);
@@ -1092,8 +1092,8 @@ void bbs_on_open(void *user, lssh_session_t *s, const char *exec_cmd){
     B.t = gt_new(wr, s, BBS_MAX_COLS, BBS_MAX_ROWS);
     if (!B.t) B.t = gt_new(wr, s, PAGE_W, PAGE_H + 2);
     if (!B.t){
-        lssh_printf(s, "GLOSSH BBS: out of memory, call back later.\r\n");
-        lssh_exit(s, 1);
+        (void)!lssh_printf(s, "GLOSSH BBS: out of memory, call back later.\r\n");
+        (void)!lssh_exit(s, 1);
         return;
     }
     gt_resize(B.t, s_pty_cols, s_pty_rows);

@@ -21,12 +21,12 @@ static bool pk_auth(void *u, const char *user, const uint8_t *blob, size_t n){
 static void on_open(void *u, lssh_session_t *s, const char *exec_cmd){
     (void)u;
     if (exec_cmd){
-        lssh_printf(s, "exec:%s\n", exec_cmd);
-        lssh_exit(s, 0);
+        (void)!lssh_printf(s, "exec:%s\n", exec_cmd);
+        (void)!lssh_exit(s, 0);
         return;
     }
-    lssh_printf(s, "littlessh test shell — user=%s pty=%d\r\n> ",
-                lssh_username(s), lssh_has_pty(s) ? 1 : 0);
+    (void)!lssh_printf(s, "littlessh test shell — user=%s pty=%d\r\n> ",
+                       lssh_username(s), lssh_has_pty(s) ? 1 : 0);
 }
 
 static char line[8192];
@@ -44,28 +44,28 @@ static void on_data(void *u, lssh_session_t *s, const uint8_t *d, size_t n){
             char *big = malloc(BIG_LEN);
             if (big){
                 memset(big, '.', BIG_LEN);
-                lssh_write(s, big, BIG_LEN);
+                (void)!lssh_write(s, big, BIG_LEN);
                 free(big);
             }
         } else if (c == '\r' || c == '\n'){
-            lssh_write(s, "\r\n", 2);
+            (void)!lssh_write(s, "\r\n", 2);
             line[line_len] = 0;
             if (strcmp(line, "exit") == 0){
-                lssh_printf(s, "bye\r\n");
-                lssh_exit(s, 0);
+                (void)!lssh_printf(s, "bye\r\n");
+                (void)!lssh_exit(s, 0);
             } else if (line_len){
-                lssh_write(s, "echo:", 5);
-                lssh_write(s, line, line_len);   /* > 1 packet for long lines */
-                lssh_write(s, "\r\n> ", 4);
+                (void)!lssh_write(s, "echo:", 5);
+                (void)!lssh_write(s, line, line_len);   /* > 1 packet for long lines */
+                (void)!lssh_write(s, "\r\n> ", 4);
             } else {
-                lssh_write(s, "> ", 2);
+                (void)!lssh_write(s, "> ", 2);
             }
             line_len = 0;
         } else if (c == 0x7f || c == 0x08){
-            if (line_len){ line_len--; lssh_write(s, "\b \b", 3); }
+            if (line_len){ line_len--; (void)!lssh_write(s, "\b \b", 3); }
         } else if (line_len < sizeof(line)-1){
             line[line_len++] = c;
-            lssh_write(s, &c, 1);   /* local echo */
+            (void)!lssh_write(s, &c, 1);   /* local echo */
         }
     }
 }

@@ -125,7 +125,7 @@ typedef struct lssh_config {
  * -3 socket/bind/listen, -4 out of memory, -5 host key, -6 accept() failed.
  * Run it in a dedicated FreeRTOS task on ESP-IDF (>= 8 KB stack
  * recommended). All memory is allocated here, before the first accept(). */
-int lssh_server_run(const lssh_config_t *cfg);
+LSSH_MUST_CHECK int lssh_server_run(const lssh_config_t *cfg);
 
 /* Write to the client's terminal (channel stdout). Fragments to the peer's
  * window/packet limits; may internally pump the connection while waiting
@@ -133,16 +133,16 @@ int lssh_server_run(const lssh_config_t *cfg);
  * Returns bytes written, which is short only if the client keeps sending
  * input while granting no window; -1 if the channel is gone. Server task
  * only (i.e. from the callbacks above). */
-ssize_t lssh_write(lssh_session_t *s, const void *data, size_t len);
+LSSH_MUST_CHECK ssize_t lssh_write(lssh_session_t *s, const void *data, size_t len);
 
 /* printf convenience over lssh_write (LF is not translated; send \r\n
  * yourself when a pty was requested). */
-ssize_t lssh_printf(lssh_session_t *s, const char *fmt, ...)
+LSSH_MUST_CHECK ssize_t lssh_printf(lssh_session_t *s, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 /* Send exit-status, EOF and close the channel. The transport then winds
  * down and lssh_server_run() loops back to accept(). */
-int lssh_exit(lssh_session_t *s, uint32_t exit_status);
+LSSH_MUST_CHECK int lssh_exit(lssh_session_t *s, uint32_t exit_status);
 
 /* Authenticated username of this session ("" before auth). */
 const char *lssh_username(const lssh_session_t *s);
@@ -158,10 +158,10 @@ const char *lssh_client_version(const lssh_session_t *s);
 
 /* --- host key helpers --- */
 /* Generate a fresh P-256 host key scalar (store it: NVS on ESP-IDF). */
-int lssh_hostkey_generate(uint8_t out[32]);
+LSSH_MUST_CHECK int lssh_hostkey_generate(uint8_t out[32]);
 /* OpenSSH-style fingerprint "SHA256:<base64>" of the corresponding public
  * key, for display/TOFU. Returns 0 on success. */
-int lssh_hostkey_fingerprint(const uint8_t key[32], char *out, size_t outlen);
+LSSH_MUST_CHECK int lssh_hostkey_fingerprint(const uint8_t key[32], char *out, size_t outlen);
 
 #ifdef __cplusplus
 }

@@ -35,8 +35,8 @@ static const char *TAG = "littlessh";
 #define LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
 #define LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
 #else
-#define LOGI(fmt, ...) fprintf(stderr, "littlessh: " fmt "\n", ##__VA_ARGS__)
-#define LOGW(fmt, ...) fprintf(stderr, "littlessh: WARN " fmt "\n", ##__VA_ARGS__)
+#define LOGI(fmt, ...) (void)fprintf(stderr, "littlessh: " fmt "\n", ##__VA_ARGS__)
+#define LOGW(fmt, ...) (void)fprintf(stderr, "littlessh: WARN " fmt "\n", ##__VA_ARGS__)
 #endif
 
 /* ---------------------------------------------------------------- consts */
@@ -93,12 +93,16 @@ static const char ALG_COMP[]    = "none";
 
 /* ------------------------------------------------------------- session  */
 
+/* A hash in progress with a latched error (like wtr_t.err): updates stay
+ * flat, err is checked once before finish. */
+typedef struct { psa_hash_operation_t op; bool err; } hsh_t;
+
 /* Everything one key exchange holds: its secrets, the running hash of H and
  * the bigger scratch buffers, kept off the stack (a rekey can run inside an
  * app callback). One instance in the session; kex_ctx_wipe() clears it
  * whenever do_kex returns. */
 typedef struct {
-    psa_hash_operation_t hop;       /* exchange hash H, fed as the exchange goes */
+    hsh_t hop;                      /* exchange hash H, fed as the exchange goes */
     bool hop_live;
     psa_key_id_t eph;               /* ephemeral X25519 key */
     bool initial, skipped;
@@ -181,8 +185,8 @@ struct lssh_session {
  * packets that arrive if that callback's writes pump the connection. */
 #define LSSH_RX_CHUNK  (LSSH_MAX_PACKET / 2)
 
-static uint64_t mono_ms(void);
-static int wait_readable(int fd, uint32_t ms);
+static LSSH_MUST_CHECK uint64_t mono_ms(void);
+static LSSH_MUST_CHECK int wait_readable(int fd, uint32_t ms);
 
 /* memset the compiler may not elide */
 static void wipe(void *p, size_t n){
@@ -196,21 +200,21 @@ typedef struct { const uint8_t *p; size_t len, off; } rdr_t;
 typedef struct { uint8_t *p; size_t cap, len; bool err; } wtr_t;
 
 static void rd_init(rdr_t *r, const uint8_t *p, size_t len) { r->p=p; r->len=len; r->off=0; }
-static bool rd_u8(rdr_t *r, uint8_t *v){ if (r->off+1>r->len) return false; *v=r->p[r->off++]; return true; }
-static bool rd_bool(rdr_t *r, bool *v){ uint8_t b; if(!rd_u8(r,&b)) return false; *v=(b!=0); return true; }
-static bool rd_u32(rdr_t *r, uint32_t *v){
+static LSSH_MUST_CHECK bool rd_u8(rdr_t *r, uint8_t *v){ if (r->off+1>r->len) return false; *v=r->p[r->off++]; return true; }
+static LSSH_MUST_CHECK bool rd_bool(rdr_t *r, bool *v){ uint8_t b; if(!rd_u8(r,&b)) return false; *v=(b!=0); return true; }
+static LSSH_MUST_CHECK bool rd_u32(rdr_t *r, uint32_t *v){
     if (r->off+4>r->len) return false;
     *v = ((uint32_t)r->p[r->off]<<24)|((uint32_t)r->p[r->off+1]<<16)|
          ((uint32_t)r->p[r->off+2]<<8)|r->p[r->off+3];
     r->off+=4; return true;
 }
-static bool rd_string(rdr_t *r, const uint8_t **s, uint32_t *slen){
+static LSSH_MUST_CHECK bool rd_string(rdr_t *r, const uint8_t **s, uint32_t *slen){
     uint32_t n; if(!rd_u32(r,&n)) return false;
     if (n > r->len - r->off) return false;   /* off <= len; off+n can wrap a 32-bit size_t */
     *s=r->p+r->off; *slen=n; r->off+=n; return true;
 }
 /* copy a string into a NUL-terminated buffer; rejects embedded NULs */
-static bool rd_cstring(rdr_t *r, char *out, size_t cap){
+static LSSH_MUST_CHECK bool rd_cstring(rdr_t *r, char *out, size_t cap){
     const uint8_t *s; uint32_t n;
     if(!rd_string(r,&s,&n) || n>=cap || memchr(s,0,n)) return false;
     memcpy(out,s,n); out[n]=0; return true;
@@ -237,7 +241,7 @@ static void wr_mpint(wtr_t *w, const uint8_t *d, size_t n){
 }
 
 /* does comma-separated name-list contain name? */
-static bool namelist_has(const uint8_t *list, uint32_t len, const char *name){
+static LSSH_MUST_CHECK bool namelist_has(const uint8_t *list, uint32_t len, const char *name){
     size_t nl = strlen(name);
     uint32_t i = 0;
     while (i < len){
@@ -251,7 +255,7 @@ static bool namelist_has(const uint8_t *list, uint32_t len, const char *name){
 
 /* -------------------------------------------------------------- sockets */
 
-static int io_recv_exact(lssh_session_t *s, uint8_t *buf, size_t n){
+static LSSH_MUST_CHECK int io_recv_exact(lssh_session_t *s, uint8_t *buf, size_t n){
     size_t got = 0;
     while (got < n){
         /* until auth succeeds the whole login shares one wall-clock budget,
@@ -274,7 +278,7 @@ static int io_recv_exact(lssh_session_t *s, uint8_t *buf, size_t n){
     return 0;
 }
 
-static int io_send_all(lssh_session_t *s, const uint8_t *buf, size_t n){
+static LSSH_MUST_CHECK int io_send_all(lssh_session_t *s, const uint8_t *buf, size_t n){
     size_t sent = 0;
     while (sent < n){
         /* a peer that already hung up must not SIGPIPE the whole server */
@@ -290,11 +294,14 @@ static int io_send_all(lssh_session_t *s, const uint8_t *buf, size_t n){
 
 /* --------------------------------------------------------------- crypto */
 
-static int rng(uint8_t *out, size_t n){
+/* psa_destroy_key / psa_hash_abort results are (void)-dropped: they run on
+ * cleanup paths where a failure leaves nothing to undo or report. */
+
+static LSSH_MUST_CHECK int rng(uint8_t *out, size_t n){
     return psa_generate_random(out, n) == PSA_SUCCESS ? 0 : -1;
 }
 
-static int sha256(const uint8_t *in, size_t inlen, uint8_t out[32]){
+static LSSH_MUST_CHECK int sha256(const uint8_t *in, size_t inlen, uint8_t out[32]){
     size_t olen = 0;
     return psa_hash_compute(PSA_ALG_SHA_256, in, inlen, out, 32, &olen)
            == PSA_SUCCESS && olen == 32 ? 0 : -1;
@@ -307,19 +314,19 @@ static void iv_increment(uint8_t iv[12]){
     }
 }
 
-static int import_gcm_key(psa_key_id_t *id, const uint8_t key[32], bool decrypt){
+static LSSH_MUST_CHECK int import_gcm_key(psa_key_id_t *id, const uint8_t key[32], bool decrypt){
     psa_key_attributes_t a = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&a, PSA_KEY_TYPE_AES);
     psa_set_key_bits(&a, 256);
     psa_set_key_algorithm(&a, PSA_ALG_GCM);
     psa_set_key_usage_flags(&a, decrypt ? PSA_KEY_USAGE_DECRYPT : PSA_KEY_USAGE_ENCRYPT);
-    if (*id){ psa_destroy_key(*id); *id = 0; }
+    if (*id){ (void)psa_destroy_key(*id); *id = 0; }
     return psa_import_key(&a, key, 32, id) == PSA_SUCCESS ? 0 : -1;
 }
 
 /* --------------------------------------------------- binary packet layer */
 
-static int send_packet(lssh_session_t *s, const uint8_t *payload, size_t plen){
+static LSSH_MUST_CHECK int send_packet(lssh_session_t *s, const uint8_t *payload, size_t plen){
     if (s->dead) return -1;
     if (plen == 0 || plen > LSSH_MAX_PACKET - 32) return -1;
 
@@ -361,7 +368,7 @@ static int send_packet(lssh_session_t *s, const uint8_t *payload, size_t plen){
 }
 
 /* Receive one packet; payload/plen point into s->payload or s->inbuf. */
-static int recv_packet(lssh_session_t *s, const uint8_t **payload, size_t *plen){
+static LSSH_MUST_CHECK int recv_packet(lssh_session_t *s, const uint8_t **payload, size_t *plen){
     if (s->dead) return -1;
     uint8_t lenb[4];
     if (io_recv_exact(s, lenb, 4)){ s->dead = true; return -1; }
@@ -402,13 +409,15 @@ static void send_disconnect(lssh_session_t *s, uint32_t reason, const char *msg)
     wr_u32(&w, reason);
     wr_cstr(&w, msg ? msg : "");
     wr_cstr(&w, "");
-    if (!w.err) send_packet(s, buf, w.len);
+    /* dead either way, so a failed send changes nothing. (void)! because GCC
+     * ignores a plain (void) on a LSSH_MUST_CHECK call. */
+    if (!w.err) (void)!send_packet(s, buf, w.len);
     s->dead = true;
 }
 
 /* ----------------------------------------------------------------- KEX  */
 
-static size_t build_kexinit(uint8_t *buf, size_t cap){
+static LSSH_MUST_CHECK size_t build_kexinit(uint8_t *buf, size_t cap){
     wtr_t w; wr_init(&w, buf, cap);
     uint8_t cookie[16];
     if (rng(cookie, 16)) return 0;
@@ -431,9 +440,9 @@ static size_t build_kexinit(uint8_t *buf, size_t cap){
 
 /* Parse client KEXINIT and check our single suite is acceptable.
  * Returns 0 ok; fills *guess_follows and *client_strict. */
-static int check_client_kexinit(const uint8_t *pl, size_t plen,
-                                bool *guess_follows, bool *client_strict,
-                                bool *guess_ok){
+static LSSH_MUST_CHECK int check_client_kexinit(const uint8_t *pl, size_t plen,
+                                                bool *guess_follows, bool *client_strict,
+                                                bool *guess_ok){
     rdr_t r; rd_init(&r, pl, plen);
     uint8_t msg; const uint8_t *l[10]; uint32_t ll[10];
     if (!rd_u8(&r,&msg) || msg != SSH_MSG_KEXINIT) return -1;
@@ -466,10 +475,15 @@ static int check_client_kexinit(const uint8_t *pl, size_t plen,
     return 0;
 }
 
-static void hash_string(psa_hash_operation_t *op, const uint8_t *d, size_t n){
+static void hs_update(hsh_t *h, const uint8_t *d, size_t n){
+    LSSH_ASSERT(h != NULL);
+    if (!h->err && psa_hash_update(&h->op, d, n) != PSA_SUCCESS) h->err = true;
+}
+
+static void hash_string(hsh_t *h, const uint8_t *d, size_t n){
     const uint8_t lb[4] = {(uint8_t)(n>>24),(uint8_t)(n>>16),(uint8_t)(n>>8),(uint8_t)n};
-    psa_hash_update(op, lb, 4);
-    if (n) psa_hash_update(op, d, n);
+    hs_update(h, lb, 4);
+    if (n) hs_update(h, d, n);
 }
 
 #define KDF_ACC 64   /* two SHA-256 blocks: enough for a 32-byte key */
@@ -482,20 +496,20 @@ static LSSH_MUST_CHECK int kdf_blocks(const uint8_t *kmp, size_t kmplen, const u
     LSSH_ASSERT(kmp != NULL && acc != NULL);
     size_t have = 0;
     while (have < need){
-        psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
-        if (psa_hash_setup(&op, PSA_ALG_SHA_256) != PSA_SUCCESS) return -1;
-        psa_hash_update(&op, kmp, kmplen);
-        psa_hash_update(&op, H, 32);
+        hsh_t h = { PSA_HASH_OPERATION_INIT, false };
+        if (psa_hash_setup(&h.op, PSA_ALG_SHA_256) != PSA_SUCCESS) return -1;
+        hs_update(&h, kmp, kmplen);
+        hs_update(&h, H, 32);
         if (have == 0){
             uint8_t c = (uint8_t)letter;
-            psa_hash_update(&op, &c, 1);
-            psa_hash_update(&op, sid, 32);
+            hs_update(&h, &c, 1);
+            hs_update(&h, sid, 32);
         } else {
-            psa_hash_update(&op, acc, have);
+            hs_update(&h, acc, have);
         }
         size_t olen = 0;
-        if (have + 32 > KDF_ACC) { psa_hash_abort(&op); return -1; }
-        if (psa_hash_finish(&op, acc + have, 32, &olen) != PSA_SUCCESS || olen != 32)
+        if (h.err || have + 32 > KDF_ACC) { (void)psa_hash_abort(&h.op); return -1; }
+        if (psa_hash_finish(&h.op, acc + have, 32, &olen) != PSA_SUCCESS || olen != 32)
             return -1;
         have += 32;
     }
@@ -516,8 +530,8 @@ static LSSH_MUST_CHECK int kdf(const uint8_t *kmp, size_t kmplen, const uint8_t 
 static void kex_ctx_wipe(lssh_session_t *s){
     LSSH_ASSERT(s != NULL);
     kex_ctx_t *k = &s->kex;
-    if (k->hop_live) psa_hash_abort(&k->hop);
-    if (k->eph) psa_destroy_key(k->eph);
+    if (k->hop_live) (void)psa_hash_abort(&k->hop.op);
+    if (k->eph) (void)psa_destroy_key(k->eph);
     wipe(k, sizeof *k);
 }
 
@@ -570,8 +584,9 @@ static LSSH_MUST_CHECK int kex_hash_start(lssh_session_t *s){
     LSSH_ASSERT(s != NULL);
     kex_ctx_t *k = &s->kex;
     LSSH_ASSERT(k->ck != NULL && !k->hop_live);
-    k->hop = hop_init;
-    if (psa_hash_setup(&k->hop, PSA_ALG_SHA_256) != PSA_SUCCESS) return -1;
+    k->hop.op = hop_init;
+    k->hop.err = false;
+    if (psa_hash_setup(&k->hop.op, PSA_ALG_SHA_256) != PSA_SUCCESS) return -1;
     k->hop_live = true;
     hash_string(&k->hop, (const uint8_t*)s->v_c, strlen(s->v_c));
     hash_string(&k->hop, (const uint8_t*)LSSH_IDENT, strlen(LSSH_IDENT));
@@ -613,9 +628,10 @@ static LSSH_MUST_CHECK int kex_recv_ecdh_init(lssh_session_t *s){
             send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "expected ECDH_INIT");
             return -1;
         }
-        rdr_t r; rd_init(&r, pl, pn); uint8_t m; rd_u8(&r,&m);
+        LSSH_ASSERT(pn >= 1);   /* recv_packet never returns an empty payload */
+        rdr_t r; rd_init(&r, pl, pn); uint8_t m;
         const uint8_t *qc = NULL; uint32_t qc_len = 0;
-        if (!rd_string(&r, &qc, &qc_len) || qc_len != 32){
+        if (!rd_u8(&r,&m) || !rd_string(&r, &qc, &qc_len) || qc_len != 32){
             send_disconnect(s, SSH_DISCONNECT_KEY_EXCHANGE_FAILED, "bad Q_C");
             return -1;
         }
@@ -660,10 +676,11 @@ static LSSH_MUST_CHECK int kex_finish_hash(lssh_session_t *s){
     hash_string(&k->hop, k->ksblob, k->ks_len);
     hash_string(&k->hop, k->q_c, 32);
     hash_string(&k->hop, k->q_s, 32);
-    psa_hash_update(&k->hop, k->kmp, k->kmp_len);   /* kmp already has length prefix */
+    hs_update(&k->hop, k->kmp, k->kmp_len);   /* kmp already has length prefix */
+    if (k->hop.err) return -1;                 /* still live: kex_ctx_wipe aborts it */
     size_t olen = 0;
     k->hop_live = false;
-    if (psa_hash_finish(&k->hop, k->H, 32, &olen) != PSA_SUCCESS || olen != 32) return -1;
+    if (psa_hash_finish(&k->hop.op, k->H, 32, &olen) != PSA_SUCCESS || olen != 32) return -1;
     if (!s->have_sid){ memcpy(s->session_id, k->H, 32); s->have_sid = true; }
     return 0;
 }
@@ -754,7 +771,7 @@ static LSSH_MUST_CHECK int do_kex(lssh_session_t *s, const uint8_t *client_kexin
 
 /* ------------------------------------------------------------- userauth */
 
-static int send_auth_failure(lssh_session_t *s){
+static LSSH_MUST_CHECK int send_auth_failure(lssh_session_t *s){
     char methods[64] = "";
     if (s->cfg->pubkey_auth) strcat(methods, "publickey");
     if (s->cfg->password_auth){
@@ -807,9 +824,9 @@ static LSSH_MUST_CHECK bool parse_user_sig(const uint8_t *sig, uint32_t sig_len,
 }
 
 /* Verify an ecdsa-sha2-nistp256 user signature over `data`. */
-static bool verify_user_ecdsa(const uint8_t *blob, uint32_t blob_len,
-                              const uint8_t *sig, uint32_t sig_len,
-                              const uint8_t *data, size_t data_len){
+static LSSH_MUST_CHECK bool verify_user_ecdsa(const uint8_t *blob, uint32_t blob_len,
+                                              const uint8_t *sig, uint32_t sig_len,
+                                              const uint8_t *data, size_t data_len){
     const uint8_t *pt = NULL;
     if (!parse_user_pubkey(blob, blob_len, &pt)) return false;
     uint8_t rs[64] = {0};
@@ -827,7 +844,7 @@ static bool verify_user_ecdsa(const uint8_t *blob, uint32_t blob_len,
     if (psa_import_key(&a, pt, 65, &k) != PSA_SUCCESS) return false;
     psa_status_t st = psa_verify_hash(k, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
                                       h, 32, rs, 64);
-    psa_destroy_key(k);
+    (void)psa_destroy_key(k);
     return st == PSA_SUCCESS;
 }
 
@@ -925,15 +942,16 @@ static LSSH_MUST_CHECK int auth_finish(lssh_session_t *s, bool ok, bool counted,
 }
 
 /* returns 0 handled, -1 fatal */
-static int handle_userauth(lssh_session_t *s, const uint8_t *pl, size_t pn){
+static LSSH_MUST_CHECK int handle_userauth(lssh_session_t *s, const uint8_t *pl, size_t pn){
     if (s->authed){ /* RFC 4252: may ignore; reply success for idempotence */
         uint8_t ok = SSH_MSG_USERAUTH_SUCCESS;
         return send_packet(s, &ok, 1);
     }
+    LSSH_ASSERT(pn >= 1);
     rdr_t r; rd_init(&r, pl, pn);
-    uint8_t m; rd_u8(&r,&m);
+    uint8_t m;
     char user[64], service[32], method[24];
-    if (!rd_cstring(&r, user, sizeof user) ||
+    if (!rd_u8(&r,&m) || !rd_cstring(&r, user, sizeof user) ||
         !rd_cstring(&r, service, sizeof service) ||
         !rd_cstring(&r, method, sizeof method)){
         send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "bad userauth");
@@ -961,7 +979,7 @@ static int handle_userauth(lssh_session_t *s, const uint8_t *pl, size_t pn){
 
 /* ----------------------------------------------------------- connection */
 
-static int ch_send_u32msg(lssh_session_t *s, uint8_t msg, uint32_t v){
+static LSSH_MUST_CHECK int ch_send_u32msg(lssh_session_t *s, uint8_t msg, uint32_t v){
     const uint8_t b[5] = {msg,(uint8_t)(v>>24),(uint8_t)(v>>16),(uint8_t)(v>>8),(uint8_t)v};
     return send_packet(s, b, 5);
 }
@@ -974,12 +992,13 @@ static void ch_teardown(lssh_session_t *s){
     s->ch_open = false;
 }
 
-static int handle_channel_open(lssh_session_t *s, const uint8_t *pl, size_t pn){
+static LSSH_MUST_CHECK int handle_channel_open(lssh_session_t *s, const uint8_t *pl, size_t pn){
+    LSSH_ASSERT(pn >= 1);
     rdr_t r; rd_init(&r, pl, pn);
-    uint8_t m; rd_u8(&r,&m);
+    uint8_t m;
     const uint8_t *type; uint32_t type_len;
     uint32_t sender, win, maxpkt;
-    if (!rd_string(&r,&type,&type_len) || !rd_u32(&r,&sender) ||
+    if (!rd_u8(&r,&m) || !rd_string(&r,&type,&type_len) || !rd_u32(&r,&sender) ||
         !rd_u32(&r,&win) || !rd_u32(&r,&maxpkt)){
         send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "bad channel open");
         return -1;
@@ -1027,11 +1046,12 @@ static LSSH_MUST_CHECK int ch_reply(lssh_session_t *s, bool want_reply, bool ok)
                           s->ch_remote_id);
 }
 
-static int handle_channel_request(lssh_session_t *s, const uint8_t *pl, size_t pn){
+static LSSH_MUST_CHECK int handle_channel_request(lssh_session_t *s, const uint8_t *pl,
+                                                  size_t pn){
+    LSSH_ASSERT(pn >= 1);
     rdr_t r; rd_init(&r, pl, pn);
     uint8_t m; uint32_t rcpt; char req[32]; bool want_reply;
-    rd_u8(&r,&m);
-    if (!rd_u32(&r,&rcpt) || !rd_cstring(&r, req, sizeof req) ||
+    if (!rd_u8(&r,&m) || !rd_u32(&r,&rcpt) || !rd_cstring(&r, req, sizeof req) ||
         !rd_bool(&r,&want_reply) || !s->ch_open){
         return 0; /* tolerate */
     }
@@ -1081,9 +1101,10 @@ static int handle_channel_request(lssh_session_t *s, const uint8_t *pl, size_t p
 static LSSH_MUST_CHECK int handle_service_request(lssh_session_t *s, const uint8_t *pl,
                                                   size_t pn){
     LSSH_ASSERT(s != NULL && pl != NULL);
-    rdr_t r; rd_init(&r, pl, pn); uint8_t m; rd_u8(&r,&m);
+    LSSH_ASSERT(pn >= 1);
+    rdr_t r; rd_init(&r, pl, pn); uint8_t m;
     const uint8_t *svc; uint32_t svc_len;
-    if (!rd_string(&r,&svc,&svc_len) || svc_len != 12 ||
+    if (!rd_u8(&r,&m) || !rd_string(&r,&svc,&svc_len) || svc_len != 12 ||
         memcmp(svc, "ssh-userauth", 12) != 0){
         send_disconnect(s, SSH_DISCONNECT_PROTOCOL_ERROR, "unknown service");
         return -1;
@@ -1108,9 +1129,10 @@ static LSSH_MUST_CHECK int handle_service_request(lssh_session_t *s, const uint8
 static LSSH_MUST_CHECK int handle_global_request(lssh_session_t *s, const uint8_t *pl,
                                                  size_t pn){
     LSSH_ASSERT(s != NULL && pl != NULL);
-    rdr_t r; rd_init(&r, pl, pn); uint8_t m; rd_u8(&r,&m);
+    LSSH_ASSERT(pn >= 1);
+    rdr_t r; rd_init(&r, pl, pn); uint8_t m;
     const uint8_t *name; uint32_t nl; bool want;
-    if (rd_string(&r,&name,&nl) && rd_bool(&r,&want) && want){
+    if (rd_u8(&r,&m) && rd_string(&r,&name,&nl) && rd_bool(&r,&want) && want){
         uint8_t b = SSH_MSG_REQUEST_FAILURE;
         return send_packet(s, &b, 1);
     }
@@ -1151,9 +1173,9 @@ static LSSH_MUST_CHECK int process_transport(lssh_session_t *s, const uint8_t *p
 static LSSH_MUST_CHECK int handle_window_adjust(lssh_session_t *s, const uint8_t *pl,
                                                 size_t pn){
     LSSH_ASSERT(s != NULL && pl != NULL);
+    LSSH_ASSERT(pn >= 1);
     rdr_t r; rd_init(&r, pl, pn); uint8_t m; uint32_t rcpt, add;
-    rd_u8(&r,&m);
-    if (rd_u32(&r,&rcpt) && rd_u32(&r,&add)){
+    if (rd_u8(&r,&m) && rd_u32(&r,&rcpt) && rd_u32(&r,&add)){
         uint64_t nw = (uint64_t)s->win_out + add;
         s->win_out = nw > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)nw;
     }
@@ -1163,10 +1185,10 @@ static LSSH_MUST_CHECK int handle_window_adjust(lssh_session_t *s, const uint8_t
 static LSSH_MUST_CHECK int handle_channel_data(lssh_session_t *s, const uint8_t *pl,
                                                size_t pn){
     LSSH_ASSERT(s != NULL && pl != NULL);
+    LSSH_ASSERT(pn >= 1);
     rdr_t r; rd_init(&r, pl, pn); uint8_t m; uint32_t rcpt;
     const uint8_t *d; uint32_t dl;
-    rd_u8(&r,&m);
-    if (!rd_u32(&r,&rcpt) || !rd_string(&r,&d,&dl) || !s->ch_open) return 0;
+    if (!rd_u8(&r,&m) || !rd_u32(&r,&rcpt) || !rd_string(&r,&d,&dl) || !s->ch_open) return 0;
     /* lssh_write() stops pumping before rxq could overflow, so this
      * only trips on a client ignoring our advertised max packet */
     if (dl > LSSH_IN_MAXPKT || dl > sizeof s->rxq - s->rxq_len){
@@ -1249,7 +1271,7 @@ static LSSH_MUST_CHECK int send_unimplemented(lssh_session_t *s){
 
 /* Process exactly one inbound packet. Returns 0 to continue, -1 to end the
  * connection. */
-static int process_packet(lssh_session_t *s){
+static LSSH_MUST_CHECK int process_packet(lssh_session_t *s){
     const uint8_t *pl; size_t pn;
     if (recv_packet(s, &pl, &pn)) return -1;
 
@@ -1361,7 +1383,8 @@ int lssh_exit(lssh_session_t *s, uint32_t exit_status){
 
 /* --------------------------------------------------------- host key mgmt */
 
-static int hostkey_import(const uint8_t *scalar, psa_key_id_t *id, uint8_t pub[65]){
+static LSSH_MUST_CHECK int hostkey_import(const uint8_t *scalar, psa_key_id_t *id,
+                                          uint8_t pub[65]){
     psa_key_attributes_t a = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&a, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
     psa_set_key_bits(&a, 256);
@@ -1376,7 +1399,7 @@ static int hostkey_import(const uint8_t *scalar, psa_key_id_t *id, uint8_t pub[6
     }
     size_t olen = 0;
     if (psa_export_public_key(k, pub, 65, &olen) != PSA_SUCCESS || olen != 65){
-        psa_destroy_key(k);
+        (void)psa_destroy_key(k);
         return -1;
     }
     *id = k;
@@ -1394,7 +1417,7 @@ int lssh_hostkey_generate(uint8_t out[32]){
     if (psa_generate_key(&a, &k) != PSA_SUCCESS) return -1;
     size_t olen = 0;
     int rc = (psa_export_key(k, out, 32, &olen) == PSA_SUCCESS && olen == 32) ? 0 : -1;
-    psa_destroy_key(k);
+    (void)psa_destroy_key(k);
     return rc;
 }
 
@@ -1426,14 +1449,14 @@ int lssh_hostkey_fingerprint(const uint8_t key[32], char *out, size_t outlen){
                 rc = 0;
             }
         }
-        psa_destroy_key(k);
+        (void)psa_destroy_key(k);
     }
     return rc;
 }
 
 /* ------------------------------------------------------------ main loops */
 
-static int version_exchange(lssh_session_t *s){
+static LSSH_MUST_CHECK int version_exchange(lssh_session_t *s){
     const char *ident = LSSH_IDENT "\r\n";
     if (io_send_all(s, (const uint8_t*)ident, strlen(ident))) return -1;
     /* read the client identification line (byte-at-a-time; happens once) */
@@ -1456,7 +1479,9 @@ static int version_exchange(lssh_session_t *s){
 
 static uint64_t mono_ms(void){
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    /* cannot fail (supported clock, our own timespec); if it did, fail
+     * closed: every deadline has passed */
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return UINT64_MAX;
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
@@ -1469,7 +1494,7 @@ static int wait_readable(int fd, uint32_t ms){
     return r > 0;
 }
 
-static bool ticking(const lssh_session_t *s){
+static LSSH_MUST_CHECK bool ticking(const lssh_session_t *s){
     return s->cfg->on_tick && s->cfg->tick_ms &&
            s->ch_open && !s->ch_sent_close && !s->dead;
 }
@@ -1513,13 +1538,14 @@ static LSSH_MUST_CHECK int listen_socket(const lssh_config_t *cfg){
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) return -1;
     int one = 1;
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    /* without it a quick restart may fail to bind, which bind() reports */
+    (void)setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
     sa.sin_port = htons(cfg->port ? cfg->port : 22);
     if (bind(lfd, (struct sockaddr*)&sa, sizeof sa) || listen(lfd, 1)){
-        close(lfd);
+        (void)close(lfd);   /* close() results are dropped: the fd is gone either way */
         return -1;
     }
     return lfd;
@@ -1531,11 +1557,16 @@ static void serve_client(lssh_session_t *s, const lssh_config_t *cfg, int cfd,
                          psa_key_id_t hostkey, const uint8_t hostkey_pub[65]){
     LSSH_ASSERT(s != NULL && cfg != NULL && hostkey_pub != NULL);
     int one = 1;
-    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    (void)setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);   /* latency only */
     if (cfg->recv_timeout_ms){
         struct timeval tv = { (time_t)(cfg->recv_timeout_ms / 1000),
                               (suseconds_t)((cfg->recv_timeout_ms % 1000) * 1000) };
-        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        /* the idle timeout is a security property: no timeout, no connection */
+        if (setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0){
+            LOGW("SO_RCVTIMEO failed, dropping connection");
+            (void)close(cfd);
+            return;
+        }
     }
 
     /* reset per-connection state, keep the allocation */
@@ -1547,9 +1578,9 @@ static void serve_client(lssh_session_t *s, const lssh_config_t *cfg, int cfd,
     s->auth_deadline = mono_ms() +
         (cfg->auth_timeout_ms ? cfg->auth_timeout_ms : LSSH_AUTH_TIMEOUT_DEFAULT_MS);
     serve_connection(s);
-    if (s->k_in) psa_destroy_key(s->k_in);
-    if (s->k_out) psa_destroy_key(s->k_out);
-    close(cfd);
+    if (s->k_in) (void)psa_destroy_key(s->k_in);
+    if (s->k_out) (void)psa_destroy_key(s->k_out);
+    (void)close(cfd);
     LOGI("connection closed");
 }
 
@@ -1568,13 +1599,13 @@ int lssh_server_run(const lssh_config_t *cfg){
     }
 
     lssh_session_t *s = calloc(1, sizeof *s);
-    if (!s){ if (own_lfd) close(lfd); return -4; }
+    if (!s){ if (own_lfd) (void)close(lfd); return -4; }
 
     /* one host key for the server's lifetime: with no configured key this
      * is the ephemeral key, so it changes per boot, not per connection */
     psa_key_id_t hostkey = 0; uint8_t hostkey_pub[65];
     if (hostkey_import(cfg->host_key, &hostkey, hostkey_pub)){
-        free(s); if (own_lfd) close(lfd); return -5;
+        free(s); if (own_lfd) (void)close(lfd); return -5;
     }
 
     LOGI("listening (%s)", LSSH_IDENT);
@@ -1590,9 +1621,9 @@ int lssh_server_run(const lssh_config_t *cfg){
         serve_client(s, cfg, cfd, hostkey, hostkey_pub);
     }
 
-    psa_destroy_key(hostkey);
+    (void)psa_destroy_key(hostkey);
     wipe(s, sizeof *s);
     free(s);
-    if (own_lfd) close(lfd);
+    if (own_lfd) (void)close(lfd);
     return rc;
 }
