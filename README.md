@@ -87,6 +87,13 @@ exceptions:
 - glotui/ and examples/ are not under the gate: glotui allocates on terminal resize, the BBS reallocs its fire buffer.
 - the gate has known limits (constructs it cannot see, holes left open from review); the header of `tools/lint.sh` lists them.
 
+## protocol conformance
+
+deviations kept on purpose:
+- RFC 4253 §6.1 says implementations MUST accept 32768-byte payloads; littlessh caps packets at `LSSH_MAX_PACKET` (4 KB). clients send channel data within the 1 KB max packet we advertise and an OpenSSH KEXINIT is ~1.5 KB, while raising the cap costs RAM: six per-session buffers are sized by it.
+- littlessh never initiates a rekey (RFC 4253 §9 RECOMMENDED after 1 GB or an hour). it answers client-initiated ones, and OpenSSH rekeys on its own.
+- received padding is not checked (minimum length, random content): after key exchange AES-GCM authenticates the whole packet.
+
 ## why
 
 bring remote console to microcontrollers without the overhead of OpenSSH or dropbear. justifiable in homelabs, field setups, and scenarios where the alternate (serial console over RF) requires human intervention. based on PSA Crypto for compatibility across ESP-IDF versions (mbedTLS 2.28/3.x/4.x).
