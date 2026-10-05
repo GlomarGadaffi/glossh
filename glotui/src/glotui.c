@@ -261,6 +261,12 @@ void gt_begin(gt_t *t){
 }
 
 void gt_end(gt_t *t){
+    /* park on the bottom row first: a terminal without an alternate screen
+     * (SyncTERM, the Linux console) ignores 1049l, and whatever the app
+     * prints next would land wherever the last frame left the cursor */
+    char b[16];
+    snprintf(b, sizeof b, "\x1b[%u;1H", (unsigned)t->rows);
+    out_str(t, b);
     out_str(t, "\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l");
     out_flush(t);
 }
