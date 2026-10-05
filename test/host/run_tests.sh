@@ -9,7 +9,7 @@ ok(){ echo "PASS: $1"; PASS=$((PASS+1)); }
 bad(){ echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 
 pkill -f './harness' 2>/dev/null; sleep 0.3
-setsid ./harness $PORT >server.log 2>&1 </dev/null &
+LSSH_AUTH_TIMEOUT_MS=2000 setsid ./harness $PORT >server.log 2>&1 </dev/null &
 SRV=$!
 sleep 0.5
 
@@ -45,14 +45,62 @@ timeout 10 ssh $OPTS -i id_ecdsa -o IdentitiesOnly=yes -o PasswordAuthentication
    -o KbdInteractiveAuthentication=no nobody@127.0.0.1 true 2>/dev/null
 [ $? -ne 0 ] && ok "unauthorized key rejected" || bad "unauthorized key accepted!"
 
-# 7. larger-than-window output (exercise fragmentation): exec returns short,
-#    so push via interactive: send a line, expect echo, plus 100 more lines
-big=$(python3 -c "print('x'*200)")
+# 7. a 5000-byte line: inbound arrives in several CHANNEL_DATA packets and the
+#    echo exceeds one outbound packet, so lssh_write() has to fragment
+big=$(python3 -c "print('x'*5000)")
 out=$(printf "$big\rexit\r" | timeout 10 sshpass -p hunter2 ssh -tt $OPTS admin@127.0.0.1 2>/dev/null)
-echo "$out" | grep -q "echo:$big" && ok "long line round-trip" || bad "long line round-trip"
+echo "$out" | grep -q "echo:$big" && ok "5000-byte line round-trip" || bad "5000-byte line round-trip"
 
+# 8. ^B writes 3 MiB from inside on_data: more than the client's window, so
+#    lssh_write() pumps inbound packets mid-callback. The rest of the same
+#    data packet ("hello\r") must survive that, and exactly 3 MiB arrives.
+out=$(printf '\002hello\rexit\r' | timeout 30 sshpass -p hunter2 ssh -tt $OPTS admin@127.0.0.1 2>/dev/null)
+dots=$(printf '%s' "$out" | tr -cd . | wc -c)
+[ "$dots" -eq 3145728 ] && echo "$out" | grep -q "echo:hello" && echo "$out" | grep -q "bye" \
+  && ok "on_data input intact across window pump (dots=$dots)" \
+  || bad "on_data input intact across window pump (dots=$dots)"
+
+# 9. client-initiated rekey mid-stream (RekeyLimit 16K vs 3 MiB of output)
+#    (ssh -E appends, so a stale log would satisfy the count on a rerun)
+rm -f c9.log
+out=$(printf '\002hello\rexit\r' | timeout 30 sshpass -p hunter2 ssh -tt $BASE -o LogLevel=DEBUG1 \
+      -o RekeyLimit=16K -E c9.log admin@127.0.0.1)
+dots=$(printf '%s' "$out" | tr -cd . | wc -c)
+kex=$(grep -c "SSH2_MSG_KEXINIT sent" c9.log)
+[ "$dots" -eq 3145728 ] && [ "$kex" -ge 2 ] && echo "$out" | grep -q "echo:hello" \
+  && ok "rekey mid-stream (kexinits=$kex dots=$dots)" || bad "rekey mid-stream (kexinits=$kex dots=$dots)"
+
+# 10. a silent / trickling pre-auth client must not hold the one slot: it is
+#     dropped at the auth deadline (2 s here) and a real client gets in
+python3 -c '
+import socket,time
+s=socket.create_connection(("127.0.0.1",'$PORT'))
+for b in b"SSH-2.0-slowloris": s.send(bytes([b])); time.sleep(1)
+' 2>/dev/null &
+LORIS=$!
+sleep 0.5
+start=$(date +%s)
+out=$(timeout 15 sshpass -p hunter2 ssh $OPTS admin@127.0.0.1 "after loris" 2>c10.log)
+el=$(( $(date +%s) - start ))
+kill $LORIS 2>/dev/null
+[ "$out" = "exec:after loris" ] && [ $el -le 6 ] && ok "pre-auth deadline frees the slot (${el}s)" \
+  || { bad "pre-auth deadline frees the slot (${el}s, out='$out')"; tail -3 c10.log; }
+
+# 11. with no host key configured, the ephemeral key holds across connections
+LSSH_EPHEMERAL=1 setsid ./harness $((PORT+1)) >server-eph.log 2>&1 </dev/null &
+EPH=$!
+sleep 0.5
+k1=$(ssh-keyscan -t ecdsa -p $((PORT+1)) 127.0.0.1 2>/dev/null | awk '{print $3}')
+k2=$(ssh-keyscan -t ecdsa -p $((PORT+1)) 127.0.0.1 2>/dev/null | awk '{print $3}')
+kill $EPH 2>/dev/null
+[ -n "$k1" ] && [ "$k1" = "$k2" ] && ok "ephemeral host key stable across connections" \
+  || bad "ephemeral host key changed between connections"
+
+kill -0 $SRV 2>/dev/null && ok "server survived every client" || bad "server died (see server.log)"
 kill $SRV 2>/dev/null
 pkill -f './harness' 2>/dev/null
 echo "=== server.log ==="; tail -20 server.log
+grep -qE "ERROR: (Address|Leak)Sanitizer|runtime error" server.log server-eph.log \
+  && bad "sanitizer clean" || ok "sanitizer clean"
 echo "RESULT: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]
