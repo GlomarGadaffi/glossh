@@ -96,11 +96,56 @@ kill $EPH 2>/dev/null
 [ -n "$k1" ] && [ "$k1" = "$k2" ] && ok "ephemeral host key stable across connections" \
   || bad "ephemeral host key changed between connections"
 
+# 12. a flood of IGNOREs before KEXINIT is cut off (LSSH_KEX_MAX_SKIP) with a
+#     protocol error, instead of holding the slot to the auth deadline (2 s)
+out=$(timeout 10 python3 rawssh.py ignore-flood $PORT 2>&1)
+[ $? -eq 0 ] && ok "IGNORE flood before KEXINIT is cut off ($out)" \
+  || bad "IGNORE flood before KEXINIT is cut off ($out)"
+
+# 13. strict KEX: a client offering kex-strict-c-v00 must send KEXINIT first
+out=$(timeout 10 python3 rawssh.py strict-ignore $PORT 2>&1)
+[ $? -eq 0 ] && ok "strict KEX: IGNORE before KEXINIT is rejected ($out)" \
+  || bad "strict KEX: IGNORE before KEXINIT is rejected ($out)"
+
+# 14-21. rawssh.py probes: what an OpenSSH client never sends (see each
+#        probe's docstring). pty-clamp is checked in the harness's on_pty log.
+probe(){
+  out=$(timeout 10 python3 rawssh.py $1 $PORT 2>&1)
+  [ $? -eq 0 ] && ok "$2 ($out)" || bad "$2 ($out)"
+}
+probe kex-disconnect "client DISCONNECT in a KEX wait ends it quietly"
+probe kex-unimplemented "UNIMPLEMENTED skipped in non-strict KEX waits"
+probe unimplemented "unknown message before auth gets UNIMPLEMENTED"
+probe auth-twice "USERAUTH_REQUEST after SUCCESS is ignored"
+probe password-change "password change request fails and counts"
+probe auth-no-service "USERAUTH_REQUEST before SERVICE_REQUEST is rejected"
+probe env "env channel request fails"
+probe pty-clamp "pty-req / window-change sent"
+grep -q "harness: pty 65535x24" server.log && grep -q "harness: pty 80x65535" server.log \
+  && ok "pty sizes clamp to 65535" \
+  || bad "pty sizes clamp to 65535 ($(grep 'harness: pty' server.log | tail -2 | tr '\n' ' '))"
+
+# 22. fingerprint of a NULL key is an error, not a random key's fingerprint
+grep -q "fingerprint(NULL) rc=-1" server.log && ok "fingerprint(NULL) fails" \
+  || bad "fingerprint(NULL) fails ($(grep -h 'fingerprint(NULL)' server.log))"
+
+# 23. EINTR is not a stall: SIGALRM every 2 ms on the server, client idle
+#     for 1 s (> 64 interrupted waits) before typing
+LSSH_SIGSTORM=1 setsid ./harness $((PORT+2)) >server-sig.log 2>&1 </dev/null &
+SIG=$!
+sleep 0.5
+out=$( (sleep 1; printf 'hello\rexit\r') | timeout 15 sshpass -p hunter2 ssh -tt \
+      $(echo "$OPTS" | sed "s/-p $PORT/-p $((PORT+2))/") admin@127.0.0.1 2>/dev/null)
+kill $SIG 2>/dev/null
+echo "$out" | grep -q "echo:hello" && echo "$out" | grep -q "bye" \
+  && ok "session survives a signal storm" \
+  || bad "session survives a signal storm ('$(echo "$out" | tr -d '\r' | tail -2 | tr '\n' ' ')')"
+
 kill -0 $SRV 2>/dev/null && ok "server survived every client" || bad "server died (see server.log)"
 kill $SRV 2>/dev/null
 pkill -f './harness' 2>/dev/null
 echo "=== server.log ==="; tail -20 server.log
-grep -qE "ERROR: (Address|Leak)Sanitizer|runtime error" server.log server-eph.log \
+grep -qE "ERROR: (Address|Leak)Sanitizer|runtime error" server.log server-eph.log server-sig.log \
   && bad "sanitizer clean" || ok "sanitizer clean"
 echo "RESULT: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

@@ -43,7 +43,7 @@ transport parameters:
 
 ## examples
 
-both examples log in as `admin` / `changeme` � demo credentials, change them before the board goes on a network you don't own. the host key is generated once and kept in NVS, so pin it on first connect rather than disabling host key checking.
+both examples log in as `admin` / `changeme` — demo credentials, change them before the board goes on a network you don't own. the host key is generated once and kept in NVS, so pin it on first connect rather than disabling host key checking.
 
 - `examples/esp32_shell` — line-oriented config shell over W5500 Ethernet (LilyGO T-ETH-ELITE S3).
 - `examples/esp32_bbs` — **GLOSSH BBS**: an ANSI-art bulletin board in the IIgs palette on the same board. terminal check, dial-up with modem LEDs, C-Net-style block logo with GeoCities hit counter, KEEP-style main menu with an animated radio tower, bulletins, last callers, live system status (heap, CPU history), a Telix-style FreeRTOS task monitor, a persistent guestbook (NVS), fire/plasma/greetz art gallery, page-the-sysop, NO CARRIER. `ssh -t admin@<board-ip>` (password `changeme`). needs 80x24; uses up to 132x50.
@@ -57,7 +57,43 @@ cd test/host && make
 
 ## tests
 
-`test/host`: `bash run_tests.sh` (littlessh vs OpenSSH: auth, pty, >4 KB lines, writes that outrun the window, client rekey, pre-auth deadline, ephemeral key stability), `./glotui_test` (renderer, CP437, keys), `./wire32_test` (wire bounds with peer-sized lengths; also `make wire32_test_m32` for a 32-bit `size_t`, where `off + n` can wrap), `bash bbs_smoke.sh` (BBS end to end vs OpenSSH, incl. idle timeout under ticks). needs libmbedtls-dev, openssh-client, sshpass.
+`test/host`: `bash run_tests.sh` (littlessh vs OpenSSH: auth, pty, >4 KB lines, writes that outrun the window, client rekey, pre-auth deadline, ephemeral key stability; `rawssh.py` probes for what OpenSSH never sends: odd messages in KEX, unknown messages, re-auth, password change, env, oversized pty), `./glotui_test` (renderer, CP437, keys), `./wire32_test` (wire bounds with peer-sized lengths; also `make wire32_test_m32` for a 32-bit `size_t`, where `off + n` can wrap), `bash bbs_smoke.sh` (BBS end to end vs OpenSSH, incl. idle timeout under ticks). needs libmbedtls-dev, openssh-client, sshpass, python3-cryptography.
+
+`bash tools/lint.sh` is the Power-of-10 gate for every `.c`/`.h` under littlessh/, run in a host and an `ESP_PLATFORM` configuration: cppcheck, clang-tidy (`.clang-tidy`: functions <= 60 lines and 60 statements, no recursion, every switch has a default, every result of a `LSSH_MUST_CHECK`/`psa_*`/`rd_*`/listed POSIX call used or cast to `(void)`, no comma operator) and `tools/p10_check.py` (no goto/setjmp after preprocessing, `LSSH_MUST_CHECK` on every non-void function, `LSSH_ASSERT` in every function and >= 2 per function on average, no constant asserts, no `#if 0`, no block macros, no calls in `?:` arms, no NOLINT/cppcheck-suppress/diagnostic pragmas). The header of `tools/lint.sh` maps each rule to its mechanism and lists the known limits. `bash tools/lint.sh --selftest` runs the real gate on a clean fixture (`tools/lint-fixture/`, must pass) and on one injected violation or negative control per rule, and fails unless each violation is reported at the injected line and each control passes.
+
+## coding rules
+
+littlessh/ follows Holzmann's Power of 10. `tools/lint.sh` checks what a tool can; the rest is review.
+
+| # | rule | littlessh | enforced by |
+|---|------|-----------|-------------|
+| 1 | no goto, setjmp/longjmp, recursion | yes | p10-goto (source and preprocessed), misc-no-recursion |
+| 2 | fixed loop bounds | yes, but for two event loops (below) | review; each bound is a buffer size or a named `LSSH_*` constant |
+| 3 | no heap after init | yes: one `calloc` in `lssh_server_run()`, before the first `accept()` | review |
+| 4 | functions <= 60 lines | yes | readability-function-size (60 lines, 60 statements), p10-function-lines |
+| 5 | >= 2 asserts per function | yes: at least one in every function, 2.47 on average | p10-assert-missing, -density, -constant |
+| 6 | smallest data scope | yes: file scope holds only const tables and the log tag | review |
+| 7 | check every result, validate arguments | yes | `LSSH_MUST_CHECK` + clang-diagnostic-unused-result, bugprone-unused-return-value, cert-err33-c |
+| 8 | limited preprocessor | yes, but for variadics (below) | p10-macro-braces, p10-config-probe, p10-if-constant, p10-macro-comma |
+| 9 | one dereference level, no function pointers | no (below) | none |
+| 10 | zero warnings, analysers on every change | analysers yes; compiler warnings (`-Wall -Wextra`) are not gated | cppcheck + clang-tidy, any diagnostic fails |
+
+`LSSH_ASSERT` guards internal invariants and app misuse of the API only. anything the peer controls stays a disconnect: on ESP-IDF a failed assert reboots the board.
+
+exceptions:
+- rule 9: the API is callbacks, i.e. function pointers in `lssh_config_t`; their results are not checked by the gate either.
+- rule 3 holds for littlessh's own code, not inside PSA: on ESP-IDF 6 every SHA-256 `psa_hash_setup` allocates (`heap_caps_malloc` in the hardware SHA driver), so each key exchange and publickey login touches the heap there.
+- rule 8: `lssh_printf` uses stdarg, and the `LOGI`/`LOGW` macros are variadic.
+- rule 2: the accept loop (`lssh_server_run`) and the per-connection loop (`serve_connection`) are event loops, bounded by `cfg->stop`, the auth deadline and the idle timeout rather than a count.
+- glotui/ and examples/ are not under the gate: glotui allocates on terminal resize, the BBS reallocs its fire buffer.
+- the gate has known limits (constructs it cannot see, holes left open from review); the header of `tools/lint.sh` lists them.
+
+## protocol conformance
+
+deviations kept on purpose:
+- RFC 4253 §6.1 says implementations MUST accept 32768-byte payloads; littlessh caps packets at `LSSH_MAX_PACKET` (4 KB). clients send channel data within the 1 KB max packet we advertise and an OpenSSH KEXINIT is ~1.5 KB, while raising the cap costs RAM: six per-session buffers are sized by it.
+- littlessh never initiates a rekey (RFC 4253 §9 RECOMMENDED after 1 GB or an hour). it answers client-initiated ones, and OpenSSH rekeys on its own.
+- received padding is not checked (minimum length, random content): after key exchange AES-GCM authenticates the whole packet.
 
 ## why
 

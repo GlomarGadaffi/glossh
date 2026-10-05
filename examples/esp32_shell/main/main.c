@@ -134,8 +134,8 @@ static bool auth_password(void *ud, const char *user, const char *pass)
 static void on_open(void *ud, lssh_session_t *s, const char *exec_cmd)
 {
     (void)ud;
-    if (exec_cmd) { lssh_printf(s, "unsupported: %s\r\n", exec_cmd); lssh_exit(s, 1); return; }
-    lssh_printf(s, "pocket-dial config shell. 'help' for commands.\r\n> ");
+    if (exec_cmd) { (void)!lssh_printf(s, "unsupported: %s\r\n", exec_cmd); (void)!lssh_exit(s, 1); return; }
+    (void)!lssh_printf(s, "pocket-dial config shell. 'help' for commands.\r\n> ");
 }
 
 static void on_data(void *ud, lssh_session_t *s, const uint8_t *data, size_t len)
@@ -146,25 +146,25 @@ static void on_data(void *ud, lssh_session_t *s, const uint8_t *data, size_t len
     for (size_t i = 0; i < len; i++) {
         char c = (char)data[i];
         if (c == '\r' || c == '\n') {
-            lssh_printf(s, "\r\n");
+            (void)!lssh_printf(s, "\r\n");
             line[pos] = 0;
             if (strcmp(line, "exit") == 0) {
-                lssh_printf(s, "bye\r\n");
-                lssh_exit(s, 0);
+                (void)!lssh_printf(s, "bye\r\n");
+                (void)!lssh_exit(s, 0);
                 pos = 0;
                 return;
             } else if (strcmp(line, "help") == 0) {
-                lssh_printf(s, "commands: help, exit\r\n");
+                (void)!lssh_printf(s, "commands: help, exit\r\n");
             } else if (pos > 0) {
-                lssh_printf(s, "unknown: %s\r\n", line);
+                (void)!lssh_printf(s, "unknown: %s\r\n", line);
             }
             pos = 0;
-            lssh_printf(s, "> ");
+            (void)!lssh_printf(s, "> ");
         } else if (c == 0x7f || c == 0x08) {  /* backspace */
-            if (pos > 0) { pos--; lssh_printf(s, "\b \b"); }
+            if (pos > 0) { pos--; (void)!lssh_printf(s, "\b \b"); }
         } else if (pos < sizeof(line) - 1 && c >= 0x20) {
             line[pos++] = c;
-            lssh_write(s, (const uint8_t *)&c, 1);  /* echo */
+            (void)!lssh_write(s, (const uint8_t *)&c, 1);  /* echo */
         }
     }
 }
@@ -192,7 +192,7 @@ static void ssh_task(void *arg)
         .on_open = on_open,
         .on_data = on_data,
     };
-    lssh_server_run(&cfg);   /* blocks; serves one client at a time */
+    (void)!lssh_server_run(&cfg);   /* blocks; serves one client at a time */
     vTaskDelete(NULL);
 }
 

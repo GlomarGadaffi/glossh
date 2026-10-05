@@ -18,6 +18,7 @@
 #ifndef LITTLESSH_H
 #define LITTLESSH_H
 
+#include <assert.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -28,6 +29,13 @@ extern "C" {
 #endif
 
 #define LSSH_VERSION_STR "0.3.0"
+
+/* Results that must not be dropped (Power of 10 rule 7). */
+#define LSSH_MUST_CHECK __attribute__((warn_unused_result))
+
+/* Internal invariants only, never peer input: on ESP-IDF a failed assert
+ * reboots the device. */
+#define LSSH_ASSERT(c) assert(c)
 
 /* Transport-level maximum packet size we accept/emit. OpenSSH KEXINIT is
  * ~1.5 KB; 4 KB leaves headroom. Raise if you need bigger channel writes
@@ -94,7 +102,9 @@ typedef struct lssh_config {
     /* Keystrokes / stdin from the client. `data` stays valid and unchanged
      * for the whole call, including across lssh_write(). */
     void (*on_data)(void *user, lssh_session_t *s, const uint8_t *data, size_t len);
-    /* pty-req and window-change. May be NULL. */
+    /* pty-req and window-change. May be NULL. Sizes above 65535 arrive as
+     * 65535; either may be 0 (RFC 4254: use the pixel size instead), so
+     * treat 0 as "unknown" rather than dividing by it. */
     void (*on_pty)(void *user, lssh_session_t *s, uint16_t cols, uint16_t rows);
     /* Channel torn down (client close, EOF+close, or transport loss). */
     void (*on_close)(void *user, lssh_session_t *s);
@@ -117,24 +127,26 @@ typedef struct lssh_config {
  * -3 socket/bind/listen, -4 out of memory, -5 host key, -6 accept() failed.
  * Run it in a dedicated FreeRTOS task on ESP-IDF (>= 8 KB stack
  * recommended). All memory is allocated here, before the first accept(). */
-int lssh_server_run(const lssh_config_t *cfg);
+LSSH_MUST_CHECK int lssh_server_run(const lssh_config_t *cfg);
 
 /* Write to the client's terminal (channel stdout). Fragments to the peer's
  * window/packet limits; may internally pump the connection while waiting
  * for window space (inbound events are queued, not delivered, meanwhile).
  * Returns bytes written, which is short only if the client keeps sending
- * input while granting no window; -1 if the channel is gone. Server task
+ * input while granting no window, or after LSSH_WRITE_MAX_PUMPS (256)
+ * packets pumped in a row without the window growing; -1 if the channel is
+ * gone. Server task
  * only (i.e. from the callbacks above). */
-ssize_t lssh_write(lssh_session_t *s, const void *data, size_t len);
+LSSH_MUST_CHECK ssize_t lssh_write(lssh_session_t *s, const void *data, size_t len);
 
 /* printf convenience over lssh_write (LF is not translated; send \r\n
  * yourself when a pty was requested). */
-ssize_t lssh_printf(lssh_session_t *s, const char *fmt, ...)
+LSSH_MUST_CHECK ssize_t lssh_printf(lssh_session_t *s, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 /* Send exit-status, EOF and close the channel. The transport then winds
  * down and lssh_server_run() loops back to accept(). */
-int lssh_exit(lssh_session_t *s, uint32_t exit_status);
+LSSH_MUST_CHECK int lssh_exit(lssh_session_t *s, uint32_t exit_status);
 
 /* Authenticated username of this session ("" before auth). */
 const char *lssh_username(const lssh_session_t *s);
@@ -150,10 +162,12 @@ const char *lssh_client_version(const lssh_session_t *s);
 
 /* --- host key helpers --- */
 /* Generate a fresh P-256 host key scalar (store it: NVS on ESP-IDF). */
-int lssh_hostkey_generate(uint8_t out[32]);
+LSSH_MUST_CHECK int lssh_hostkey_generate(uint8_t out[32]);
 /* OpenSSH-style fingerprint "SHA256:<base64>" of the corresponding public
- * key, for display/TOFU. Returns 0 on success. */
-int lssh_hostkey_fingerprint(const uint8_t key[32], char *out, size_t outlen);
+ * key, for display/TOFU. Returns 0 on success; -1 on failure, including
+ * key == NULL (the ephemeral key a NULL host_key gets is made inside
+ * lssh_server_run() and has no fingerprint here). */
+LSSH_MUST_CHECK int lssh_hostkey_fingerprint(const uint8_t key[32], char *out, size_t outlen);
 
 #ifdef __cplusplus
 }

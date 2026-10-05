@@ -161,7 +161,7 @@ static void ssh_task(void *arg)
         .on_tick = bbs_on_tick,
         .tick_ms = BBS_TICK_MS,
     };
-    lssh_server_run(&cfg);   /* blocks; serves one caller at a time */
+    (void)!lssh_server_run(&cfg);   /* blocks; serves one caller at a time */
     vTaskDelete(NULL);
 }
 
