@@ -13,7 +13,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y build-essential libmbedtls-dev openssh-client sshpass \
-            python3 procps util-linux cppcheck clang-tidy git
+            python3 procps util-linux cppcheck clang-tidy git gcc-multilib
       - uses: actions/checkout@v4
       - name: host tests
         run: |
@@ -21,6 +21,8 @@ jobs:
           make
           bash run_tests.sh
           ./glotui_test
+          ./wire32_test
+          make wire32_test_m32 && ./wire32_test_m32
           bash bbs_smoke.sh
       - name: lint selftest
         run: bash tools/lint.sh --selftest
