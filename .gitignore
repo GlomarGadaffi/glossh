@@ -15,7 +15,6 @@ dependencies.lock
 Thumbs.db
 
 # local docs — read the code
-docs/
 notes/
 *.txt
 !CMakeLists.txt
