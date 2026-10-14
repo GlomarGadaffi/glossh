@@ -121,6 +121,82 @@ nav{font-family:var(--mono);font-size:.8em;letter-spacing:.04em;color:var(--ink-
 .bbs-btns button{font-family:var(--mono);background:#1a1a1a;color:#eee;border:1px solid #444;padding:5px 10px;font-size:.82em;cursor:pointer;border-radius:2px}
 .bbs-btns button:hover{background:#333;border-color:var(--brass)}
 </style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "@id": "https://glomargadaffi.github.io/glossh/#faq",
+  "isPartOf": {
+    "@id": "https://glomargadaffi.github.io/glossh/#code"
+  },
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What is glossh?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "An SSH 2.0 server for ESP-IDF microcontrollers. Run ssh admin@<board> and you get a device console: a config shell, a status screen, or an ANSI-art BBS."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does it need OpenSSH or Dropbear on the device?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. glossh is a small server written for microcontrollers, so it doesn't need the footprint of OpenSSH or Dropbear. It is built on PSA Crypto."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which SSH algorithms does it use?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Key exchange is curve25519-sha256 with strict KEX. The host key is ecdsa-sha2-nistp256. The cipher is aes256-gcm@openssh.com. Users can log in with a password, a public key, or both."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does it support SFTP or port forwarding?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. It is meant for device consoles, not bulk file transfer, so there is no SFTP, port forwarding or agent forwarding."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How many clients can connect at once?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "One. An unauthenticated client can't hold the slot, because the login has to finish within auth_timeout_ms, 60 seconds by default."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Has it been tested on hardware?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not yet. The README says it is host-tested against OpenSSH 10 in CI, and the examples build with ESP-IDF 6.0.2. Hardware testing is still to come."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which hardware does the example run on?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The config shell and GLOSSH BBS examples target the LilyGO T-ETH-ELITE S3, an ESP32-S3 with W5500 Ethernet. The BBS can also run on a Linux desktop for testing."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What license is it under?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Apache-2.0."
+      }
+    }
+  ]
+}
+</script>
 </head>
 <body>
 
@@ -354,6 +430,26 @@ idf.py build flash monitor
 ssh -t admin@&lt;board-ip&gt;            # password: changeme</code></pre>
 
 </main>
+
+<section class="faq" id="faq">
+<h2>Frequently asked questions</h2>
+<h3>What is glossh?</h3>
+<p>An SSH 2.0 server for ESP-IDF microcontrollers. Run ssh admin@&lt;board&gt; and you get a device console: a config shell, a status screen, or an ANSI-art BBS.</p>
+<h3>Does it need OpenSSH or Dropbear on the device?</h3>
+<p>No. glossh is a small server written for microcontrollers, so it doesn&#x27;t need the footprint of OpenSSH or Dropbear. It is built on PSA Crypto.</p>
+<h3>Which SSH algorithms does it use?</h3>
+<p>Key exchange is curve25519-sha256 with strict KEX. The host key is ecdsa-sha2-nistp256. The cipher is aes256-gcm@openssh.com. Users can log in with a password, a public key, or both.</p>
+<h3>Does it support SFTP or port forwarding?</h3>
+<p>No. It is meant for device consoles, not bulk file transfer, so there is no SFTP, port forwarding or agent forwarding.</p>
+<h3>How many clients can connect at once?</h3>
+<p>One. An unauthenticated client can&#x27;t hold the slot, because the login has to finish within auth_timeout_ms, 60 seconds by default.</p>
+<h3>Has it been tested on hardware?</h3>
+<p>Not yet. The README says it is host-tested against OpenSSH 10 in CI, and the examples build with ESP-IDF 6.0.2. Hardware testing is still to come.</p>
+<h3>Which hardware does the example run on?</h3>
+<p>The config shell and GLOSSH BBS examples target the LilyGO T-ETH-ELITE S3, an ESP32-S3 with W5500 Ethernet. The BBS can also run on a Linux desktop for testing.</p>
+<h3>What license is it under?</h3>
+<p>Apache-2.0.</p>
+</section>
 
 <footer>
   <p style="font-family:var(--mono);font-size:.8em;color:var(--ink-dim);margin-top:3em;padding-top:1em;border-top:1px solid var(--line)">
