@@ -18,6 +18,8 @@
 #include "nvs.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_wifi.h"
+#include "bootloader_random.h"
 #include "esp_eth.h"
 #include "esp_eth_mac_w5500.h"
 #include "esp_eth_phy_w5500.h"
@@ -107,6 +109,25 @@ static void eth_start(void)
     xEventGroupWaitBits(s_eth_evt, GOT_IP_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
 }
 
+/* ── entropy: the RNG is only a true RNG while the RF or SAR ADC runs ──── */
+/* Ethernet-only board: bring the WiFi radio up (no connect, nothing sent)
+ * just for host key generation, then tear it down. */
+static esp_err_t radio_entropy_on(void)
+{
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&wcfg);
+    if (err == ESP_OK) err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err == ESP_OK) err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) err = esp_wifi_start();
+    return err;
+}
+
+static void radio_entropy_off(void)
+{
+    (void)esp_wifi_stop();
+    (void)esp_wifi_deinit();
+}
+
 /* ── host key persistence: 32-byte P-256 scalar in NVS ─────────────────── */
 static esp_err_t hostkey_load_or_create(uint8_t key[32])
 {
@@ -116,8 +137,12 @@ static esp_err_t hostkey_load_or_create(uint8_t key[32])
     size_t len = 32;
     err = nvs_get_blob(h, "hostkey", key, &len);
     if (err == ESP_OK && len == 32) { nvs_close(h); return ESP_OK; }
-    ESP_LOGW(TAG, "generating new host key");
-    if (lssh_hostkey_generate(key) != 0) { nvs_close(h); return ESP_FAIL; }
+    ESP_LOGW(TAG, "generating new host key (WiFi radio on for entropy)");
+    err = radio_entropy_on();
+    int rc = err == ESP_OK ? lssh_hostkey_generate(key) : -1;
+    radio_entropy_off();
+    if (err != ESP_OK) { nvs_close(h); return err; }
+    if (rc != 0) { nvs_close(h); return ESP_FAIL; }
     err = nvs_set_blob(h, "hostkey", key, 32);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
@@ -174,6 +199,9 @@ static void ssh_task(void *arg)
     (void)arg;
     static uint8_t hostkey[32];
     ESP_ERROR_CHECK(hostkey_load_or_create(hostkey));
+    /* radio is off again: the SAR ADC feeds the RNG for each connection's
+     * X25519 key, cookie and padding (nothing else here uses the ADC) */
+    bootloader_random_enable();
 
     char fp[64];
     if (lssh_hostkey_fingerprint(hostkey, fp, sizeof(fp)) == 0)
