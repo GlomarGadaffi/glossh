@@ -9,7 +9,7 @@
  *
  * Output modes: exact palette over 24-bit SGR, nearest xterm-256, nearest of
  * the 16 ANSI colors, or raw CP437 bytes for ANSI-BBS terminals (SyncTERM).
- * Not thread-safe; drive one gt_t from one task.
+ * Not thread-safe; drive one gt_t from one task. Requires C99 or later.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -55,6 +55,24 @@ typedef void (*gt_write_fn)(void *ctx, const void *data, size_t len);
 /* The canvas is the terminal clipped to max_cols x max_rows, centered. */
 gt_t *gt_new(gt_write_fn wr, void *ctx, uint16_t max_cols, uint16_t max_rows);
 void  gt_free(gt_t *t);
+
+/* Caller-provided storage, for firmware that forbids heap after init: mem
+ * holds the instance, front and back hold cap cells each, and nothing is
+ * ever allocated. The canvas can never exceed cap cells, so gt_resize fails
+ * (nothing changes) when the clipped terminal size needs more; NULL when the
+ * initial 80x24 does not fit. gt_free on it frees nothing. The instance
+ * size follows GT_OUTBUF: define it the same way for every translation unit. */
+#ifndef GT_OUTBUF
+#define GT_OUTBUF 3072      /* one write per ~SSH packet; keep < LSSH_MAX_PACKET */
+#endif
+#define GT_STATIC_SIZE (GT_OUTBUF + 512)
+typedef union {
+    long double ld; void *p; long long ll; double d;   /* C99 alignment, no max_align_t */
+    unsigned char bytes[GT_STATIC_SIZE];
+} gt_static_t;
+gt_t *gt_new_static(gt_static_t *mem, gt_cell_t *front, gt_cell_t *back, size_t cap,
+                    gt_write_fn wr, void *ctx, uint16_t max_cols, uint16_t max_rows);
+
 /* Terminal size changed (pty-req / window-change). Clears the canvas and
  * forces a full repaint. False if the buffers could not grow (the canvas
  * keeps its previous size). */

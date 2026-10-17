@@ -10,10 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef GT_OUTBUF
-#define GT_OUTBUF 3072      /* one write per ~SSH packet; keep < LSSH_MAX_PACKET */
-#endif
-
 /* Apple IIgs Hardware Reference, standard 16 colors ($0RGB -> 0xRRGGBB). */
 const uint32_t GT_PALETTE_IIGS[16] = {
     0x000000, 0xDD0033, 0x000099, 0xDD22DD,
@@ -139,6 +135,7 @@ struct gt {
     uint16_t cols, rows, ox, oy;
     size_t   cap;
     gt_cell_t *back, *front;
+    bool     fixed;                     /* caller-provided storage: never (re)allocate or free */
 
     int vx, vy, vw, vh;
 
@@ -202,20 +199,41 @@ void gt_set_palette(gt_t *t, const uint32_t rgb[16]){
     gt_invalidate(t);
 }
 
-gt_t *gt_new(gt_write_fn wr, void *ctx, uint16_t max_cols, uint16_t max_rows){
-    gt_t *t = calloc(1, sizeof *t);
-    if (!t) return NULL;
+/* Shared by both constructors: t is zeroed, with its storage fields set. */
+static bool init(gt_t *t, gt_write_fn wr, void *ctx, uint16_t max_cols, uint16_t max_rows){
     t->wr = wr; t->ctx = ctx;
     t->max_cols = max_cols ? max_cols : 80;
     t->max_rows = max_rows ? max_rows : 24;
     t->want_x = t->want_y = -1;
     gt_set_palette(t, GT_PALETTE_IIGS);
-    if (!gt_resize(t, 80, 24)){ free(t); return NULL; }
+    return gt_resize(t, 80, 24);
+}
+
+gt_t *gt_new(gt_write_fn wr, void *ctx, uint16_t max_cols, uint16_t max_rows){
+    gt_t *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    if (!init(t, wr, ctx, max_cols, max_rows)){ free(t); return NULL; }
     return t;
 }
 
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(gt_t) <= sizeof(gt_static_t), "GT_STATIC_SIZE is too small for struct gt");
+#else
+typedef char gt_static_size_check[sizeof(gt_t) <= sizeof(gt_static_t) ? 1 : -1];
+#endif
+
+gt_t *gt_new_static(gt_static_t *mem, gt_cell_t *front, gt_cell_t *back, size_t cap,
+                    gt_write_fn wr, void *ctx, uint16_t max_cols, uint16_t max_rows){
+    if (!mem || !front || !back) return NULL;
+    gt_t *t = (gt_t*)mem;
+    memset(t, 0, sizeof *t);
+    t->fixed = true;
+    t->front = front; t->back = back; t->cap = cap;
+    return init(t, wr, ctx, max_cols, max_rows) ? t : NULL;
+}
+
 void gt_free(gt_t *t){
-    if (!t) return;
+    if (!t || t->fixed) return;
     free(t->back); free(t->front); free(t);
 }
 
@@ -226,6 +244,7 @@ bool gt_resize(gt_t *t, uint16_t tc, uint16_t tr){
     uint16_t r = tr < t->max_rows ? tr : t->max_rows;
     size_t need = (size_t)c * r;
     if (need > t->cap){
+        if (t->fixed) return false;         /* caller-provided cells: never grow */
         gt_cell_t *b = malloc(need * sizeof *b), *f = malloc(need * sizeof *f);
         if (!b || !f){ free(b); free(f); return false; }
         free(t->back); free(t->front);

@@ -9,8 +9,10 @@ all: harness glotui_test bbs_host wire32_test
 harness: harness.c $(LSSH)/src/littlessh.c
 	$(CC) $(CFLAGS) -o $@ $^ -lmbedcrypto
 
+# --wrap counts every heap call glotui makes (the static-storage test needs
+# zero); libc-internal allocations are not routed through the wrappers
 glotui_test: glotui_test.c $(GTUI)/src/glotui.c
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=free -o $@ $^
 
 bbs_host: bbs_host.c bbs_plat_posix.c $(BBS)/bbs.c $(BBS)/bbs_art.c \
           $(GTUI)/src/glotui.c $(LSSH)/src/littlessh.c

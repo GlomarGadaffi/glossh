@@ -15,6 +15,15 @@ static void wr(void *ctx, const void *d, size_t n){
 }
 static void reset(void){ outn = 0; out[0] = 0; }
 
+/* heap calls made by glotui (the Makefile links with -Wl,--wrap=...) */
+static int allocs;
+void *__real_malloc(size_t n);
+void *__real_calloc(size_t n, size_t m);
+void  __real_free(void *p);
+void *__wrap_malloc(size_t n){ allocs++; return __real_malloc(n); }
+void *__wrap_calloc(size_t n, size_t m){ allocs++; return __real_calloc(n, m); }
+void  __wrap_free(void *p){ __real_free(p); }
+
 static int keys[64], nkeys;
 static void on_key(void *ctx, int k){ (void)ctx; if (nkeys < 64) keys[nkeys++] = k; }
 static void feed(gt_keys_t *k, const char *s){ nkeys = 0; gt_keys_feed(k, (const uint8_t*)s, strlen(s), on_key, NULL); }
@@ -155,11 +164,72 @@ static void test_end(void){
     gt_free(t);
 }
 
+/* one frame of a fixed scene: draw step `step`, flush, copy the bytes out */
+static size_t frame(gt_t *t, int step, char *dst){
+    if (step == 0){
+        gt_box(t, 2, 1, 30, 6, GT_BOX_DOUBLE, GT_LIGHT_BLUE, GT_DARK_BLUE);
+        gt_text(t, 4, 3, GT_YELLOW, GT_DARK_BLUE, "static ═ heap");
+        gt_pipe(t, 4, 4, "|12ok|04!");
+        gt_cursor(t, 5, 5);
+    } else {
+        gt_put(t, 5, 3, 'X', GT_WHITE, GT_DARK_BLUE);
+        gt_shadow(t, 2, 1, 30, 6);
+    }
+    reset(); gt_flush(t);
+    if (dst) memcpy(dst, out, outn + 1);        /* NULL: leave the bytes in out */
+    return outn;
+}
+
+/* gt_new_static: caller-provided storage, zero heap calls over the whole
+ * lifecycle; the canvas never grows past the given capacity */
+static void test_static(void){
+    enum { CAP = 80 * 24 };
+    static gt_static_t mem;
+    static gt_cell_t front[CAP], back[CAP];
+    static char ref[sizeof out];
+
+    allocs = 0;
+    gt_t *h = gt_new(wr, NULL, 132, 50);
+    CHECK(h && allocs > 0);                         /* the counter sees the heap path */
+
+    CHECK(gt_new_static(&mem, front, back, CAP - 1, wr, NULL, 132, 50) == NULL);  /* 80x24 must fit */
+    allocs = 0;
+    gt_t *s = gt_new_static(&mem, front, back, CAP, wr, NULL, 132, 50);
+    CHECK(s != NULL);
+    CHECK(gt_cols(s) == 80 && gt_rows(s) == 24);
+    CHECK(gt_at(s, 0, 0) == back);                  /* draws into the caller's cells */
+
+    /* same drawing, same bytes on the wire: the full repaint and a diff */
+    CHECK(gt_resize(h, 80, 24) && gt_resize(s, 80, 24));
+    for (int step = 0; step < 2; step++){
+        size_t nh = frame(h, step, ref), ns = frame(s, step, NULL);
+        CHECK(nh > 0 && nh == ns && memcmp(ref, out, nh) == 0);
+    }
+
+    /* within capacity: works; beyond: refused with size and buffers kept */
+    CHECK(gt_resize(s, 40, 12) && gt_cols(s) == 40 && gt_rows(s) == 12 && gt_at(s, 0, 0) == back);
+    CHECK(!gt_resize(s, 132, 50));                  /* 6600 cells > 1920 */
+    CHECK(gt_cols(s) == 40 && gt_rows(s) == 12 && gt_at(s, 39, 11) == back + 40 * 12 - 1);
+    CHECK(!gt_resize(s, 81, 24));                   /* 1944 > 1920, one row over */
+    gt_cursor(s, -1, -1); gt_flush(s);              /* drain the 40x12 repaint */
+    gt_put(s, 0, 0, 'Z', GT_WHITE, GT_BLACK);       /* still usable after a refusal */
+    reset(); gt_flush(s);
+    CHECK(outn > 0 && out[outn - 1] == 'Z');
+    CHECK(gt_resize(s, 80, 24) && gt_cols(s) == 80 && gt_rows(s) == 24);   /* exactly CAP */
+    CHECK(gt_resize(s, 200, 60) == false);          /* clipped to 132x50: still too big */
+    CHECK(gt_resize(s, 20, 500) && gt_cols(s) == 20 && gt_rows(s) == 50);  /* 1000 cells, centered */
+
+    gt_free(s);
+    CHECK(allocs == 0);                             /* no heap call across the static lifecycle */
+    gt_free(h);
+}
+
 int main(void){
     test_cp437();
     test_render();
     test_end();
     test_keys();
+    test_static();
     printf(fails ? "glotui: %d FAILED\n" : "glotui: all tests passed\n", fails);
     return fails != 0;
 }

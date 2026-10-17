@@ -77,6 +77,7 @@ a terminal UI over any byte stream (`glotui/`). draw CP437 glyphs into a cell bu
 - BBS pipe codes (`|00`-`|31`), boxes, shadows, views with clipping
 - a key decoder for arrows, F-keys and Alt
 - no dependencies beyond libc
+- `gt_new_static()` runs on caller-provided storage (instance + two cell buffers) and never allocates: a resize past that capacity is refused, not grown
 
 ## examples
 
@@ -132,7 +133,7 @@ littlessh/ follows Holzmann's Power of 10, checked by `bash tools/lint.sh`: cppc
 exceptions:
 - rule 2: the accept loop and the per-connection loop are event loops, bounded by `cfg->stop`, the login deadline and the idle timeout rather than a count.
 - rule 8: `lssh_printf` uses stdarg and the log macros are variadic.
-- glotui/ and examples/ are not under the gate: glotui allocates on terminal resize, the BBS reallocs its fire buffer.
+- glotui/ and examples/ are not under the gate: a `gt_new()` instance allocates on terminal resize (`gt_new_static()` does not), the BBS reallocs its fire buffer.
 - the gate's known limits are listed in the header of `tools/lint.sh`.
 
 ## protocol conformance
