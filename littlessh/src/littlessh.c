@@ -835,7 +835,8 @@ static LSSH_MUST_CHECK int kex_finish_hash(lssh_session_t *s){
     return 0;
 }
 
-/* sign H with the host key (ECDSA-SHA256 over H), send KEX_ECDH_REPLY */
+/* sign H with the host key (RFC 6979 deterministic ECDSA-SHA256 over H, so
+ * the nonce never depends on the RNG), send KEX_ECDH_REPLY */
 static LSSH_MUST_CHECK int kex_send_reply(lssh_session_t *s){
     LSSH_ASSERT(s != NULL);
     kex_ctx_t *k = &s->kex;
@@ -843,7 +844,7 @@ static LSSH_MUST_CHECK int kex_send_reply(lssh_session_t *s){
     LSSH_ASSERT(s->hostkey != 0);
     size_t rs_len = 0;
     if (sha256(k->H, 32, k->h2)) return -1;
-    if (psa_sign_hash(s->hostkey, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
+    if (psa_sign_hash(s->hostkey, PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256),
                       k->h2, 32, k->rs, sizeof k->rs, &rs_len) != PSA_SUCCESS || rs_len != 64)
         return -1;
 
@@ -1651,7 +1652,7 @@ static LSSH_MUST_CHECK int hostkey_import(const uint8_t *scalar, psa_key_id_t *i
     psa_key_attributes_t a = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&a, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
     psa_set_key_bits(&a, 256);
-    psa_set_key_algorithm(&a, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+    psa_set_key_algorithm(&a, PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256));
     psa_set_key_usage_flags(&a, PSA_KEY_USAGE_SIGN_HASH);
     psa_key_id_t k = 0;
     if (scalar){
@@ -1676,7 +1677,7 @@ int lssh_hostkey_generate(uint8_t out[32]){
     psa_key_attributes_t a = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&a, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
     psa_set_key_bits(&a, 256);
-    psa_set_key_algorithm(&a, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+    psa_set_key_algorithm(&a, PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256));
     psa_set_key_usage_flags(&a, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
     psa_key_id_t k = 0;
     if (psa_generate_key(&a, &k) != PSA_SUCCESS) return -1;
