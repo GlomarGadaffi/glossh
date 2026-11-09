@@ -28,7 +28,7 @@
 extern "C" {
 #endif
 
-#define LSSH_VERSION_STR "0.3.0"
+#define LSSH_VERSION_STR "0.3.1"
 
 /* Results that must not be dropped (Power of 10 rule 7). */
 #define LSSH_MUST_CHECK __attribute__((warn_unused_result))
