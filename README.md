@@ -8,7 +8,7 @@ an SSH console for microcontrollers. `ssh admin@<board>` and you're on the devic
 
 it is meant for device consoles, not bulk transfer: no SFTP, no port forwarding, no agent forwarding.
 
-status: v0.3.1. host-tested against OpenSSH 10 in CI; the examples build warning-free with ESP-IDF 6.0.2. **not yet tested on hardware.**
+status: v0.3.2. host-tested against OpenSSH 10 in CI; the examples build warning-free with ESP-IDF 6.0.2. **not yet tested on hardware.**
 
 ## try it on a desktop
 
